@@ -143,9 +143,9 @@ class DocumentObject(FlatCAMObj):
 
         self.build_ui()
 
-        # TODO does not work, why?
-        # switch the notebook area to Properties Tab
-        # self.app.ui.notebook.setCurrentWidget(self.app.ui.properties_tab)
+        # switch the notebook area to the Properties Tab. It is deferred because the object selection that follows
+        # this method would set the notebook back to the tab that was active before.
+        QtCore.QTimer.singleShot(20, lambda: self.app.ui.notebook.setCurrentWidget(self.app.ui.properties_tab))
 
     @property
     def read_only(self):

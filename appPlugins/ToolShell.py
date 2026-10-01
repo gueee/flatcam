@@ -82,7 +82,16 @@ class TermWidget(QWidget):
         self._history = ['']  # current empty line
         self._historyIndex = 0
 
+        # Whether the output is scrolled to the bottom. It is tracked here because the scrollbar range changes when
+        # the input box grows to fit a second line, which makes comparing the value with the maximum at the time
+        # new text is added unreliable.
+        self._browser_at_bottom = True
+        self._browser.verticalScrollBar().valueChanged.connect(self._on_browser_scrolled)
+
         self._delete_line.clicked.connect(self.on_delete_line_clicked)
+
+    def _on_browser_scrolled(self, value):
+        self._browser_at_bottom = value == self._browser.verticalScrollBar().maximum()
 
     def command_line(self):
         return self._edit
@@ -167,17 +176,11 @@ class TermWidget(QWidget):
 
         scrollbar = self._browser.verticalScrollBar()
         old_value = scrollbar.value()
-        # scrollattheend = old_value == scrollbar.maximum()
+        # moving the cursor scrolls the output to the end, therefore the state is read before that happens
+        scrollattheend = self._browser_at_bottom
 
         self._browser.moveCursor(QTextCursor.MoveOperation.End)
         self._browser.insertHtml(text)
-
-        """TODO When user enters second line to the input, and input is resized, scrollbar changes its position
-        and stops moving. As quick fix of this problem, now we always scroll down when add new text.
-        To fix it correctly, scroll to the bottom, if before input has been resized,
-        scrollbar was in the bottom, and remove next line
-        """
-        scrollattheend = True
 
         if scrollattheend:
             scrollbar.setValue(scrollbar.maximum())
@@ -399,10 +402,10 @@ class FCShell(TermWidget):
             which is caught in exec_command and displayed in TCL shell console with red background.
             Error in console is displayed  with TCL  trace.
 
-            This behavior works only within main thread,
-            errors with promissed tasks can be catched and detected only with log.
-            TODO: this problem have to be addressed somehow, maybe rewrite promissing to be blocking somehow for
-            TCL shell.
+            A command that derives from TclCommandSignaled runs in a worker thread. Its exception is stored by
+            TclCommandSignaled.execute_call() and raised in the main thread once the command finished, so it is
+            reported in the shell like any other error. A command that starts a task of its own and returns before
+            that task is done can still only be followed in the log.
 
             Kamil's comment: I will rewrite existing TCL commands from time to time to follow this rules.
 

@@ -548,6 +548,7 @@ class AppDefaults:
         "tools_ncc_newdia": 0.1,
         "tools_ncc_plotting": 'normal',
         "tools_ncc_check_valid": True,
+        "tools_ncc_simplification": 0.01,
 
         # Cutout Tool
         "tools_cutout_tooldia": 2.4,

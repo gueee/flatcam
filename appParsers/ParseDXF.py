@@ -496,31 +496,21 @@ def get_geo_from_insert(dxf_object, insert, text_mode='stroke'):
             if tr[0] != 0 or tr[1] != 0:
                 geo = translate(geo, (tr[0] - block_coords[0]), (tr[1] - block_coords[1]))
             
-            # ============================================================
-            # KNOWN ISSUE: Array handling may produce duplicates
-            # TODO: Fix pre-existing bug where array insertions with
-            # row_count > 1 OR column_count > 1 produce extra geometries.
-            # Current logic appends in each loop PLUS final append.
-            # See Limitations section for details.
-            # ============================================================
-            # support for array block insertions
-            if r_count > 1:
-                for r in range(r_count):
-                    geo_block_transformed.append(translate(geo, (tr[0] + (r * r_spacing) - block_coords[0]), 0))
-            if c_count > 1:
-                for c in range(c_count):
-                    geo_block_transformed.append(translate(geo, 0, (tr[1] + (c * c_spacing) - block_coords[1])))
-            
             if sx != 1 or sy != 1:
                 geo = scale(geo, sx, sy)
             if phi != 0:
-                if isinstance(tr, str) and tr.lower() == 'c':
-                    tr = 'center'
-                elif isinstance(tr, ezdxf_vector):
-                    tr = list(tr)
-                geo = rotate(geo, phi, origin=tr)
+                origin = tr
+                if isinstance(origin, str) and origin.lower() == 'c':
+                    origin = 'center'
+                elif isinstance(origin, ezdxf_vector):
+                    origin = list(origin)
+                geo = rotate(geo, phi, origin=origin)
             
-            geo_block_transformed.append(geo)
+            # support for array block insertions; the rows are spaced along Y and the columns along X.
+            # An insert that is not an array has a single row and a single column.
+            for row in range(max(r_count, 1)):
+                for col in range(max(c_count, 1)):
+                    geo_block_transformed.append(translate(geo, col * c_spacing, row * r_spacing))
         
         log.debug(f"INSERT block '{insert.dxf.name}' converted {len(geo_block)} entities")
         

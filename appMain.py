@@ -791,8 +791,11 @@ class App(QtCore.QObject):
                 json.dump([], fp)
 
         # Application directory. CHDIR to it. Otherwise, trying to load GUI icons will fail as their path is relative.
-        # This will fail under cx_freeze ...
-        self.app_home = os.path.dirname(os.path.realpath(__file__))
+        # In a frozen application the modules live inside an archive therefore the directory of this file is not a
+        # directory on the disk; the bundled data is in the folder that the freezer reports instead.
+        self.app_home = getattr(sys, '_MEIPASS', None) if getattr(sys, 'frozen', False) else None
+        if not self.app_home:
+            self.app_home = os.path.dirname(os.path.realpath(__file__))
 
         # cx_freeze workaround
         if os.path.isfile(self.app_home):
@@ -1804,9 +1807,69 @@ class App(QtCore.QObject):
         ]:
             self.on_properties_tab_click()
 
-        # TODO handle changing the units in the Preferences
-        # if key_changed == "units":
-        #     self.on_toggle_units(no_pref=False)
+        if key_changed == "units":
+            self.on_units_changed()
+
+    def on_units_changed(self):
+        """
+        Convert the project to the measuring units that were chosen in Preferences. All the objects in the project
+        are scaled.
+
+        :return: None
+        """
+        if self.toggle_units_ignore:
+            return
+
+        new_units = self.options["units"].upper()
+        if new_units == self.app_units.upper():
+            return
+
+        # the units can not be changed while inside an Editor
+        if self.call_source in ['geo_editor', 'grb_editor', 'exc_editor']:
+            self.inform.emit('[WARNING_NOTCL] %s' % _("Units cannot be changed while the editor is active."))
+            # restore the previous units without running this handler again
+            self.toggle_units_ignore = True
+            self.options["units"] = self.app_units
+            self.toggle_units_ignore = False
+            return
+
+        # the scaling factor depending on the choice of units
+        factor = 25.4 if new_units == 'MM' else 1 / 25.4
+
+        self.app_units = new_units
+
+        # update the objects in the project with the new units
+        for obj in self.collection.get_list():
+            obj.convert_units(new_units)
+            # make sure that the properties stored in the object are also updated
+            self.app_obj.object_changed.emit(obj)
+            obj.build_ui()
+
+        # update the workspace if it is active
+        if self.options['global_workspace'] is True:
+            self.plotcanvas.draw_workspace(workspace_size=self.options['global_workspaceT'])
+
+        # adjust the grid values on the main toolbar
+        val_x = round(float(self.options['global_gridx']) * factor, self.decimals)
+        val_y = val_x if self.ui.grid_gap_link_cb.isChecked() else \
+            round(float(self.options['global_gridy']) * factor, self.decimals)
+        self.options['global_gridx'] = val_x
+        self.options['global_gridy'] = val_y
+        self.ui.grid_gap_x_entry.set_value(val_x, decimals=self.decimals)
+        self.ui.grid_gap_y_entry.set_value(val_y, decimals=self.decimals)
+
+        # update the Properties form of the selected object
+        current = self.collection.get_active()
+        if current is not None and not isinstance(current, GeometryObject):
+            # for a Geometry object the converted values are transferred to the form in AppObjectTemplate.py
+            current.to_form()
+
+        self.ui.units_label.setText("[%s]" % new_units.lower())
+        self.plot_all()
+
+        # the objects changed therefore the project should be saved
+        self.should_we_save = True
+        self.inform.emit('[success] %s: %s' % (_("Converted units to"), new_units))
 
     def on_app_restart(self):
 

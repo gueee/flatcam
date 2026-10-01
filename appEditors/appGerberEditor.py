@@ -4509,6 +4509,31 @@ class AppGerberEditor(QtCore.QObject):
             else:
                 self.last_aperture_selected = int(self.ui.apertures_table.item(0, 1).text())
 
+    @staticmethod
+    def apertures_are_alike(first_aperture, second_aperture):
+        """
+        Check if two apertures draw the same pad. The rectangular and the obround apertures are described by their
+        width and height while the others are described by their size.
+
+        :param first_aperture:      aperture dict, as stored in self.storage_dict
+        :type first_aperture:       dict
+        :param second_aperture:     aperture dict, as stored in self.storage_dict
+        :type second_aperture:      dict
+        :rtype:                     bool
+        """
+        if first_aperture['type'] != second_aperture['type']:
+            return False
+
+        if first_aperture['type'] in ['R', 'O']:
+            attributes = ['width', 'height']
+        else:
+            attributes = ['size']
+
+        for attribute in attributes:
+            if first_aperture.get(attribute, None) != second_aperture.get(attribute, None):
+                return False
+        return True
+
     def on_tool_edit(self):
         if self.ui.apertures_table.currentItem() is None:
             return
@@ -4526,8 +4551,6 @@ class AppGerberEditor(QtCore.QObject):
         # rows start with 0, tools start with 1, so we adjust the value by 1
         key_in_tid2apcode = row_of_item_changed + 1
         ap_code_old = self.tid2apcode[key_in_tid2apcode]
-
-        ap_code_new = self.ui.apertures_table.item(row_of_item_changed, 1).text()
 
         if col_of_item_changed == 1:
             # we edited the Aperture Code column (int)
@@ -4563,8 +4586,8 @@ class AppGerberEditor(QtCore.QObject):
 
             if len(val_edited) != 2:
                 self.app.inform.emit("[WARNING_NOTCL] %s" % _("Dimensions need two float values separated by comma."))
-                old_dims_txt = '%s, %s' % (str(self.storage_dict[ap_code_new]['width']),
-                                           str(self.storage_dict[ap_code_new]['height']))
+                old_dims_txt = '%s, %s' % (str(self.storage_dict[ap_code_old]['width']),
+                                           str(self.storage_dict[ap_code_old]['height']))
 
                 self.ui.apertures_table.currentItem().setText(old_dims_txt)
                 # we reactivate the signals after the tool editing
@@ -4574,7 +4597,6 @@ class AppGerberEditor(QtCore.QObject):
                 self.app.inform.emit("[success] %s" % _("Dimensions edited."))
 
         # In case we edited the Aperture Code therefore the val_edited holds a new Aperture Code
-        # TODO Edit of the Aperture Code is not active yet
         if col_of_item_changed == 1:
             # aperture code is not used, so we create a new Aperture with the desired Aperture Code
             if val_edited not in self.oldapcode_newapcode.values():
@@ -4587,27 +4609,31 @@ class AppGerberEditor(QtCore.QObject):
                 self.storage_dict[val_edited] = old_aperture_val
 
             else:
-                # aperture code is already in use so, we move the pads from the prior tool to the new tool
-                # but only if they are of the same type
+                # aperture code is already in use so, we move the pads from the prior aperture to the new one,
+                # but only if the two apertures would draw the same pad
+                old_aperture = self.storage_dict[ap_code_old]
+                new_aperture = self.storage_dict[val_edited]
 
-                if self.storage_dict[ap_code_old]['type'] == self.storage_dict[ap_code_new]['type']:
-                    # TODO I have to work here; if type == 'R' or 'O' have t otake care of all attributes ...
-                    factor = val_edited / float(ap_code_old)
-                    geometry = []
-                    for geo_el in self.storage_dict[ap_code_old]:
-                        geometric_data = geo_el.geo
-                        new_geo_el = {}
-                        if 'solid' in geometric_data:
-                            new_geo_el['solid'] = deepcopy(scale(geometric_data['solid'], xfact=factor, yfact=factor))
-                        if 'follow' in geometric_data:
-                            new_geo_el['follow'] = deepcopy(scale(geometric_data['follow'], xfact=factor, yfact=factor))
-                        if 'clear' in geometric_data:
-                            new_geo_el['clear'] = deepcopy(scale(geometric_data['clear'], xfact=factor, yfact=factor))
-                        geometry.append(new_geo_el)
+                if not self.apertures_are_alike(old_aperture, new_aperture):
+                    self.app.inform.emit(
+                        '[WARNING_NOTCL] %s' % _("The aperture code is used by an aperture of another shape. "
+                                                 "Merging is possible only between apertures that are identical.")
+                    )
+                    # restore the aperture code that the user edited
+                    self.ui.apertures_table.currentItem().setText(str(ap_code_old))
+                    self.plot_all()
+                    # we reactivate the signals after the tool editing
+                    self.ui.apertures_table.itemChanged.connect(self.on_tool_edit)
+                    return
 
-                    self.add_gerber_shape(geometry, self.storage_dict[val_edited])
+                # the pads are not changed, only the aperture that draws them
+                for geo_el in old_aperture['geometry']:
+                    self.add_gerber_shape(DrawToolShape(deepcopy(geo_el.geo)), new_aperture['geometry'])
 
-                    self.on_aperture_delete(ap_code=ap_code_old)
+                self.on_aperture_delete(ap_code=ap_code_old)
+                self.app.inform.emit(
+                    '[success] %s: %s' % (_("Merged the aperture into the aperture with code"), str(val_edited))
+                )
 
         # In case we edited the Size of the Aperture therefore the val_edited holds the new Aperture Size
         # It will happen only for the Aperture Type == 'C' - I make sure of that in the self.build_ui()

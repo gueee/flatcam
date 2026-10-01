@@ -142,8 +142,7 @@ class ToolMilling(Excellon, AppTool):
         self.grid_status_memory = self.app.ui.grid_snap_btn.isChecked()
 
         # store here the state of the exclusion checkbox state to be restored after building the UI
-        # TODO add this in the self.app.options dict and in Preferences
-        self.exclusion_area_cb_is_checked = False
+        self.exclusion_area_cb_is_checked = self.app.options["tools_mill_area_exclusion"]
 
         # store here solid_geometry when there are tool with isolation job
         self.solid_geometry = []
@@ -3873,6 +3872,7 @@ class ToolMilling(Excellon, AppTool):
 
     def update_exclusion_table(self):
         self.exclusion_area_cb_is_checked = True if self.ui.exclusion_cb.isChecked() else False
+        self.app.options["tools_mill_area_exclusion"] = self.exclusion_area_cb_is_checked
 
         self.build_ui()
         self.ui.exclusion_cb.set_value(self.exclusion_area_cb_is_checked)

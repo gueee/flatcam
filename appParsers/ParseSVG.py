@@ -60,6 +60,32 @@ def svgparselength(lengthstr: str) -> tuple[float, str | float | None]:
     return 0, 0
 
 
+# how many SVG user units (px) there are in one of the absolute length units of the SVG specification
+SVG_UNITS_IN_USER_UNITS = {
+    'px': 1.0,
+    'pt': 96.0 / 72.0,
+    'pc': 96.0 / 6.0,
+    'in': 96.0,
+    'cm': 96.0 / 2.54,
+    'mm': 96.0 / 25.4,
+}
+
+
+def svgparselength_userunits(lengthstr: str) -> float:
+    """
+    Parse an SVG length string and convert it to SVG user units. A length with a relative unit ('em', 'ex' or '%')
+    can not be resolved without the context of the element, therefore its number is used as it is.
+
+    :param lengthstr:   SVG length string.
+    :return:            the length in user units
+    :rtype:             float
+    """
+    value, units = svgparselength(lengthstr)
+    if not units or units not in SVG_UNITS_IN_USER_UNITS:
+        return value
+    return value * SVG_UNITS_IN_USER_UNITS[units]
+
+
 def svgparse_viewbox(root):
     val = root.get('viewBox')
     if val is None:
@@ -323,11 +349,11 @@ def svgcircle2shapely(circle, n_points=64, factor=1.0):
     # cx = float(circle.get('cx'))
     # cy = float(circle.get('cy'))
     # r = float(circle.get('r'))
-    cx = svgparselength(circle.get('cx'))[0]  # TODO: No units support yet
+    cx = svgparselength_userunits(circle.get('cx'))
     cx = cx * factor if cx else cx
-    cy = svgparselength(circle.get('cy'))[0]  # TODO: No units support yet
+    cy = svgparselength_userunits(circle.get('cy'))
     cy = cy * factor if cy else cy
-    r = svgparselength(circle.get('r'))[0]  # TODO: No units support yet
+    r = svgparselength_userunits(circle.get('r'))
     r = r * factor if r else r
 
     return Point(cx, cy).buffer(r, resolution=n_points)
@@ -347,14 +373,14 @@ def svgellipse2shapely(ellipse, n_points=64, factor=1.0):
     :rtype:             shapely.geometry.polygon.LinearRing
     """
 
-    cx = svgparselength(ellipse.get('cx'))[0]   # TODO: No units support yet
+    cx = svgparselength_userunits(ellipse.get('cx'))
     cx = cx * factor if cx else cx
-    cy = svgparselength(ellipse.get('cy'))[0]   # TODO: No units support yet
+    cy = svgparselength_userunits(ellipse.get('cy'))
     cy = cy * factor if cy else cy
 
-    rx = svgparselength(ellipse.get('rx'))[0]   # TODO: No units support yet
+    rx = svgparselength_userunits(ellipse.get('rx'))
     rx = rx * factor if rx else rx
-    ry = svgparselength(ellipse.get('ry'))[0]   # TODO: No units support yet
+    ry = svgparselength_userunits(ellipse.get('ry'))
     ry = ry * factor if ry else ry
 
     t = np.arange(n_points, dtype=float) / n_points

@@ -775,7 +775,7 @@ class NccGen:
             tool_ordering=tool_ordering if tool_ordering is not None else self.ui.order_combo.get_value(),
             clipping_type=self.ui.select_method_combo.get_value(),
             rest_machining_choice=self.ui.rest_cb.get_value(),
-            simplification_value=0.01,  # TODO this should be in preferences and in the UI
+            simplification_value=self.app.options["tools_ncc_simplification"],
             # determine if to use the progressive plotting
             prog_plot=self.app.options.get("tools_ncc_plotting") == 'progressive',
             tools_storage=tools_storage if tools_storage is not None else self.ncc_tools,

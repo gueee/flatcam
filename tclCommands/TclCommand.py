@@ -414,18 +414,16 @@ class TclCommandSignaled(TclCommand):
             # set detail for processing, it will be there until next open or close
             self.app.shell.open_processing(self.get_current_command())
 
-            def handle_finished():
-                self.app.shell_command_finished.disconnect(handle_finished)
-                if self.error is not None:
-                    self.raise_tcl_unknown_error(self.error)
-
-            self.app.shell_command_finished.connect(handle_finished)
-
             with wait_signal(self.app.shell_command_finished, passed_timeout):
                 # every TclCommandNewObject ancestor  support  timeout as parameter,
                 # but it does not mean anything for child itself
                 # when operation  will be  really long is good  to set it higher then defqault 30s
                 self.app.worker_task.emit({'fcn': self.execute_call, 'params': [args, unnamed_args]})
+
+            # the command ran in a worker thread therefore its exception was stored by self.execute_call().
+            # It is raised here, in the main thread, so that it is reported in the Tcl shell.
+            if self.error is not None:
+                raise self.error
 
             return self.output
 

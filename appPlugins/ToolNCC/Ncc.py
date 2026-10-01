@@ -598,8 +598,8 @@ class ToolNcc(Gerber, AppTool):
         try:
             current_uid = int(self.ui.tools_table.item(current_row, 3).text())
             self.ncc_tools[current_uid]['data']['tools_ncc_operation'] = val
-            # TODO got a crash here, a KeyError exception; need to see it again and find out the why
-        except AttributeError:
+        except (AttributeError, KeyError):
+            # there is no row selected or the tool of that row is gone
             return
 
     def on_object_selection_changed(self, current):

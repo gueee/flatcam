@@ -353,6 +353,21 @@ class ToolsNCCPrefGroupUI(OptionsGroupUI):
 
         gen_grid.addWidget(self.valid_cb, 10, 0, 1, 2)
 
+        # Simplification tolerance
+        self.simplification_label = FCLabel('%s:' % _("Simplification"))
+        self.simplification_label.setToolTip(
+            _("The tolerance used when simplifying the resulting paths.\n"
+              "A bigger value means fewer points in the paths and therefore\n"
+              "a smaller GCode file, but less accurate paths.")
+        )
+        self.simplification_entry = FCDoubleSpinner()
+        self.simplification_entry.set_precision(self.decimals)
+        self.simplification_entry.set_range(0.0000, 1.0000)
+        self.simplification_entry.setSingleStep(0.001)
+
+        gen_grid.addWidget(self.simplification_label, 12, 0)
+        gen_grid.addWidget(self.simplification_entry, 12, 1)
+
         GLay.set_common_column_size([par_grid, tool_grid, gen_grid], 0)
 
         self.layout.addStretch(1)

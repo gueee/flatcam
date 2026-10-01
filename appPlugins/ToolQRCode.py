@@ -275,6 +275,9 @@ class QRCode(AppTool):
 
                 svg_text = StringIO(svg_file.getvalue().decode('UTF-8'))
                 svg_geometry = self.convert_svg_to_geo(svg_text, units=self.units)
+                if svg_geometry == 'fail':
+                    self.app.inform.emit('[ERROR_NOTCL] %s' % _("Failed. Could not create the QRCode geometry."))
+                    return 'fail'
                 self.qrcode_geometry = deepcopy(svg_geometry)
 
                 svg_geometry = unary_union(svg_geometry).buffer(0.0000001).buffer(-0.0000001)
@@ -515,10 +518,29 @@ class QRCode(AppTool):
         # Change origin to bottom left
         # h = float(svg_root.get('height'))
         # w = float(svg_root.get('width'))
-        h = svgparselength(svg_root.get('height'))[0]  # TODO: No units support yet
+        h, svg_units = svgparselength(svg_root.get('height'))
+
+        svg_unit_to_mm = {
+            'mm': 1.0,
+            'cm': 10.0,
+            'in': 25.4,
+            'px': 25.4 / 96.0,
+            'pt': 25.4 / 72.0,
+        }
+
+        if svg_units in ['em', 'ex', '%']:
+            self.app.log.error("QRCode.convert_svg_to_geo(). SVG units not supported: %s" % svg_units)
+            return 'fail'
+
         units = self.app.app_units if units is None else units
         res = self.app.options['geometry_circle_steps']
         factor = svgparse_viewbox(svg_root)
+
+        if svg_units in svg_unit_to_mm:
+            unit_factor = svg_unit_to_mm[svg_units]
+            factor *= unit_factor
+            h *= unit_factor
+
         geos = getsvggeo(svg_root, object_type, units=units, res=res, factor=factor, app=self.app)
 
         self.app.log.debug("QRCode.import_svg(). Finished parsing the SVG geometry.")
