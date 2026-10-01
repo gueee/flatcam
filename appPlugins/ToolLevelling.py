@@ -14,6 +14,7 @@ from appGUI.GUIElements import VerticalScrollArea, FCLabel, FCButton, FCFrame, G
 
 import logging
 from copy import deepcopy
+import re
 import sys
 
 from shapely import Point, MultiPoint, MultiPolygon, box
@@ -66,6 +67,15 @@ log = logging.getLogger('base')
 
 class ToolLevelling(CNCjob, AppTool):
     build_al_table_sig = QtCore.pyqtSignal()
+    grbl_job_progress_sig = QtCore.pyqtSignal(str)
+    grbl_job_finished_sig = QtCore.pyqtSignal()
+
+    # a motion command: G0, G1, G2, G3 and their zero padded forms. It will not match G20, G21, G38.2 and such.
+    motion_re = re.compile(r"G0*([0-3])(?!\d)", re.IGNORECASE)
+    # a X, Y or Z coordinate word
+    coord_re = re.compile(r"([XYZ])\s*([-+]?\d*\.?\d+)", re.IGNORECASE)
+    # the answer of the GRBL controller to a probing command: [PRB:0.000,0.000,-1.234:1]
+    prb_re = re.compile(r"\[PRB:\s*([-+]?[\d.]+)\s*,\s*([-+]?[\d.]+)\s*,\s*([-+]?[\d.]+)\s*:\s*(\d)]")
 
     def __init__(self, app):
         self.app = app
@@ -116,6 +126,11 @@ class ToolLevelling(CNCjob, AppTool):
 
         self.solid_geo = None
         self.grbl_ser_port = None
+
+        # set when the user stops a job that is being sent to the GRBL controller
+        self.grbl_job_stop = False
+        # how long to wait for the controller to acknowledge a line of the job; a slow move takes a while
+        self.grbl_job_line_timeout = 300.0
 
         self.probing_shapes = None
 
@@ -192,6 +207,8 @@ class ToolLevelling(CNCjob, AppTool):
 
     def connect_signals_at_init(self):
         self.build_al_table_sig.connect(self.build_al_table)
+        self.grbl_job_progress_sig.connect(self.on_grbl_job_progress)
+        self.grbl_job_finished_sig.connect(self.on_grbl_job_finished)
         self.ui.level.toggled.connect(self.on_level_changed)
 
         self.ui.avoid_exc_holes_cb.toggled.connect(self.on_avoid_exc_holes)
@@ -235,6 +252,8 @@ class ToolLevelling(CNCjob, AppTool):
         self.ui.pause_resume_button.clicked.connect(self.on_grbl_pause_resume)
         self.ui.grbl_get_heightmap_button.clicked.connect(self.on_grbl_autolevel)
         self.ui.grbl_save_height_map_button.clicked.connect(self.on_grbl_heightmap_save)
+        self.ui.grbl_send_job_button.clicked.connect(self.on_grbl_send_job)
+        self.ui.grbl_stop_job_button.clicked.connect(self.on_grbl_stop_job)
 
         # When object selection on canvas change
         self.app.proj_selection_changed.connect(self.on_object_selection_changed)
@@ -406,14 +425,6 @@ class ToolLevelling(CNCjob, AppTool):
         self.on_level_changed(self.ui.level.isChecked())
 
     def on_level_changed(self, checked):
-
-        target_obj = self.app.collection.get_by_name(self.ui.object_combo.get_value())
-
-        # if 'Roland' in target_obj.pp_excellon_name or 'Roland' in target_obj.pp_geometry_name or 'hpgl' in \
-        #         target_obj.pp_geometry_name:
-        #     # TODO DO NOT AUTOLEVELL
-        #     pass
-
         if not checked:
             self.ui.level.setText('%s' % _('Beginner'))
             self.ui.level.setStyleSheet("""
@@ -1086,23 +1097,258 @@ class ToolLevelling(CNCjob, AppTool):
             self.app.on_jump_to()
 
     def autolevell_gcode(self):
-        pass
+        """
+        Apply the probed heights over the GCode of the selected CNCJob object such that the cutting depth follows
+        the measured surface of the material.
 
-    def autolevell_gcode_line(self, gcode_line):
+        :return:    'fail' if the levelling could not be done, None otherwise
+        :rtype:     str
+        """
+        target_obj = self.app.collection.get_by_name(self.ui.object_combo.get_value())
+        if target_obj is None:
+            self.app.inform.emit('[ERROR_NOTCL] %s' % _("Could not retrieve object"))
+            return 'fail'
+
+        if getattr(target_obj, 'is_levelled_gcode', False) is True:
+            self.app.inform.emit(
+                '[WARNING_NOTCL] %s' % _("The GCode of this object is already levelled. Generate it again to "
+                                        "level it with new probing data.")
+            )
+            return 'fail'
+
         al_method = self.ui.al_method_radio.get_value()
+        if al_method == 'b':
+            heights = [pt[2] for pt in self.al_bilinear_geo_storage]
+        else:
+            heights = [val['height'] for val in self.al_voronoi_geo_storage.values()]
 
-        coords = ()
+        if not heights or all(h == 0.0 for h in heights):
+            self.app.inform.emit(
+                '[ERROR_NOTCL] %s' % _("There is no height data. Do a probing job or import a height map first.")
+            )
+            return 'fail'
 
-        if al_method == 'v':
-            self.autolevell_voronoi(gcode_line, coords)
-        elif al_method == 'b':
-            self.autolevell_bilinear(gcode_line, coords)
+        dec = target_obj.coords_decimals
 
-    def autolevell_bilinear(self, gcode_line, coords):
-        pass
+        levelled_something = False
 
-    def autolevell_voronoi(self, gcode_line, coords):
-        pass
+        # for a multi tool job the GCode of each tool is stored separately and it is the one that gets exported
+        if target_obj.multitool is True and target_obj.tools:
+            for tooluid_key in target_obj.tools:
+                tool_gcode = target_obj.tools[tooluid_key].get('gcode', None)
+                if tool_gcode:
+                    new_gcode = self.autolevell_gcode_block(tool_gcode, dec=dec)
+                    levelled_something = levelled_something or new_gcode != tool_gcode
+                    target_obj.tools[tooluid_key]['gcode'] = new_gcode
+
+        if target_obj.gcode:
+            new_gcode = self.autolevell_gcode_block(target_obj.gcode, dec=dec)
+            levelled_something = levelled_something or new_gcode != target_obj.gcode
+            target_obj.gcode = new_gcode
+
+        if not levelled_something:
+            # the job was made with a preprocessor that does not output GCode moves, HPGL and Roland for example
+            self.app.inform.emit(
+                '[WARNING_NOTCL] %s' % _("Nothing was levelled. This job holds no moves that the levelling can "
+                                        "work with.")
+            )
+            return 'fail'
+
+        target_obj.is_levelled_gcode = True
+
+        # rebuild the text that the Code Review tab displays and that is saved on export
+        try:
+            new_code = target_obj.export_gcode(preamble=target_obj.prepend_snippet,
+                                               postamble=target_obj.append_snippet,
+                                               to_file=True,
+                                               s_code=target_obj.gc_start)
+            try:
+                target_obj.source_file = new_code.getvalue()
+            except AttributeError:
+                target_obj.source_file = new_code
+        except Exception as e:
+            self.app.log.error("ToolLevelling.autolevell_gcode() --> %s" % str(e))
+
+        self.app.inform.emit('[success] %s' % _("Finished autolevelling."))
+
+    def autolevell_gcode_block(self, gcode, dec=4):
+        """
+        Apply the probed heights over a block of GCode.
+
+        :param gcode:   the GCode to be levelled
+        :type gcode:    str
+        :param dec:     number of decimals used for the Z coordinate
+        :type dec:      int
+        :return:        the levelled GCode
+        :rtype:         str
+        """
+        new_lines = []
+        # the position before the current line; the Z is the programmed one, without any levelling applied
+        coords = (None, None, None)
+
+        for gcode_line in gcode.splitlines():
+            new_line, coords = self.autolevell_gcode_line(gcode_line, coords, dec=dec)
+            new_lines.append(new_line)
+
+        levelled_gcode = '\n'.join(new_lines)
+        if gcode.endswith('\n'):
+            levelled_gcode += '\n'
+        return levelled_gcode
+
+    def autolevell_gcode_line(self, gcode_line, coords=(None, None, None), dec=4):
+        """
+        Apply the probed heights over a single line of GCode. The programmed depth is kept and the height of the
+        material surface is added to it.
+
+        :param gcode_line:  a line of GCode
+        :type gcode_line:   str
+        :param coords:      the (x, y, z) position before this line; the Z is the programmed one
+        :type coords:       tuple
+        :param dec:         number of decimals used for the Z coordinate
+        :type dec:          int
+        :return:            the new line and the (x, y, z) position after this line
+        :rtype:             tuple
+        """
+        pos_x, pos_y, nominal_z = coords
+
+        # a comment can hold anything, therefore it is not parsed
+        body, sep, comment = gcode_line.partition('(')
+
+        if not self.motion_re.search(body):
+            return gcode_line, coords
+
+        words = {}
+        for match in self.coord_re.finditer(body):
+            words[match.group(1).upper()] = float(match.group(2))
+
+        new_x = words.get('X', pos_x)
+        new_y = words.get('Y', pos_y)
+        if 'Z' in words:
+            nominal_z = words['Z']
+
+        new_coords = (new_x, new_y, nominal_z)
+
+        # a line without any coordinate (setting the feedrate for example) is not a move
+        if 'Z' not in words and 'X' not in words and 'Y' not in words:
+            return gcode_line, new_coords
+
+        # the height is not known before the first move or before the first Z
+        if new_x is None or new_y is None or nominal_z is None:
+            return gcode_line, new_coords
+
+        # an arc holds no Z of its own; adding one would turn it into a helix
+        motion = int(self.motion_re.search(body).group(1))
+        if motion > 1 and 'Z' not in words:
+            return gcode_line, new_coords
+
+        z_txt = 'Z' + '%.*f' % (dec, nominal_z + self.autolevell_height(new_x, new_y))
+
+        if 'Z' in words:
+            body = self.coord_re.sub(
+                lambda m: z_txt if m.group(1).upper() == 'Z' else m.group(0), body)
+        else:
+            body = body.rstrip() + ' ' + z_txt
+
+        return body + sep + comment, new_coords
+
+    def autolevell_height(self, x, y):
+        """
+        The height of the material surface in the (x, y) point, according to the probed data.
+
+        :return:    the surface height
+        :rtype:     float
+        """
+        if self.ui.al_method_radio.get_value() == 'b':
+            return self.autolevell_bilinear(x, y)
+        return self.autolevell_voronoi(x, y)
+
+    def autolevell_bilinear(self, x, y):
+        """
+        The surface height in the (x, y) point, interpolated from the four probe points that surround it.
+
+        :return:    the surface height
+        :rtype:     float
+        """
+        pts = self.al_bilinear_geo_storage
+        rows = self.ui.al_rows_entry.get_value()
+        cols = self.ui.al_columns_entry.get_value()
+
+        # points that avoid the Excellon holes are moved therefore the grid may be incomplete
+        if rows < 2 or cols < 2 or len(pts) != (rows * cols):
+            return self.autolevell_closest_height(x, y)
+
+        # the probe points are stored row by row, starting with the lower left corner
+        grid_x = [pts[col][0] for col in range(cols)]
+        grid_y = [pts[row * cols][1] for row in range(rows)]
+
+        col = self.autolevell_cell_index(grid_x, x)
+        row = self.autolevell_cell_index(grid_y, y)
+
+        x0, x1 = grid_x[col], grid_x[col + 1]
+        y0, y1 = grid_y[row], grid_y[row + 1]
+
+        z00 = pts[row * cols + col][2]
+        z10 = pts[row * cols + col + 1][2]
+        z01 = pts[(row + 1) * cols + col][2]
+        z11 = pts[(row + 1) * cols + col + 1][2]
+
+        ratio_x = 0.0 if x1 == x0 else (x - x0) / (x1 - x0)
+        ratio_y = 0.0 if y1 == y0 else (y - y0) / (y1 - y0)
+
+        z_low = z00 + (z10 - z00) * ratio_x
+        z_high = z01 + (z11 - z01) * ratio_x
+        return z_low + (z_high - z_low) * ratio_y
+
+    def autolevell_voronoi(self, x, y):
+        """
+        The surface height in the (x, y) point, taken from the probe point whose Voronoi cell holds it.
+
+        :return:    the surface height
+        :rtype:     float
+        """
+        pt = Point((x, y))
+
+        for val in self.al_voronoi_geo_storage.values():
+            cell = val['geo']
+            if cell is not None and cell.intersects(pt):
+                return val['height']
+
+        # outside of the probed area or without a Voronoi diagram
+        return self.autolevell_closest_height(x, y)
+
+    def autolevell_closest_height(self, x, y):
+        """
+        The height of the probe point that is the closest to the (x, y) point.
+
+        :return:    the surface height
+        :rtype:     float
+        """
+        if self.ui.al_method_radio.get_value() == 'b':
+            pts = [(pt[0], pt[1], pt[2]) for pt in self.al_bilinear_geo_storage]
+        else:
+            pts = [
+                (val['point'].x, val['point'].y, val['height']) for val in self.al_voronoi_geo_storage.values()
+            ]
+
+        if not pts:
+            return 0.0
+
+        return min(pts, key=lambda p: (p[0] - x) ** 2 + (p[1] - y) ** 2)[2]
+
+    @staticmethod
+    def autolevell_cell_index(grid_values, val):
+        """
+        The index of the grid cell that holds val. A value outside of the grid gets the closest border cell which
+        means that it is extrapolated.
+
+        :return:    index of the lower edge of the cell
+        :rtype:     int
+        """
+        idx = 0
+        for i in range(len(grid_values) - 1):
+            if val >= grid_values[i]:
+                idx = i
+        return min(idx, len(grid_values) - 2)
 
     def on_show_al_table(self, state):
         self.ui.al_probe_points_table.show() if state else self.ui.al_probe_points_table.hide()
@@ -1251,9 +1497,8 @@ class ToolLevelling(CNCjob, AppTool):
                 pass
 
             answer = self.on_grbl_wake()
-            answer = ['ok']   # FIXME: hack for development without a GRBL controller connected
             for line in answer:
-                if 'ok' in line.lower():
+                if 'ok' in line.lower() or 'grbl' in line.lower():
                     self.ui.com_connect_button.setStyleSheet("QPushButton {background-color: seagreen;}")
                     self.ui.com_connect_button.setText(_("Connected"))
                     self.ui.controller_reset_button.setDisabled(False)
@@ -1307,10 +1552,57 @@ class ToolLevelling(CNCjob, AppTool):
         # Wait for GRBL controller to initialize
         time.sleep(1)
 
-        grbl_out = deepcopy(self.grbl_ser_port.readlines())
+        grbl_out = self.grbl_decode(self.grbl_ser_port.readlines())
         self.grbl_ser_port.reset_input_buffer()
 
         return grbl_out
+
+    @staticmethod
+    def grbl_decode(grbl_lines):
+        """
+        Decode the lines read from the serial port.
+
+        :param grbl_lines:  lines of bytes as read from the serial port
+        :type grbl_lines:   list
+        :return:            the decoded lines, without the line endings
+        :rtype:             list
+        """
+        decoded = []
+        for line in grbl_lines:
+            try:
+                decoded.append(line.decode('utf-8', errors='replace').strip())
+            except AttributeError:
+                # already a string
+                decoded.append(str(line).strip())
+        return decoded
+
+    def grbl_read_reply(self, timeout=30.0):
+        """
+        Read the answer of the GRBL controller until it acknowledges the command with 'ok' or reports a problem.
+        The serial port has a short read timeout therefore reading is repeated until the deadline.
+
+        :param timeout: for how long to wait for an acknowledgement, in seconds
+        :type timeout:  float
+        :return:        the answer lines of the controller and whether it acknowledged the command
+        :rtype:         tuple
+        """
+        deadline = time.monotonic() + timeout
+        answer = []
+
+        while time.monotonic() < deadline:
+            new_lines = self.grbl_decode(self.grbl_ser_port.readlines())
+            answer += [line for line in new_lines if line != '']
+
+            for line in answer:
+                low_line = line.lower()
+                if low_line.startswith('ok'):
+                    return answer, True
+                if low_line.startswith('error') or low_line.startswith('alarm'):
+                    return answer, False
+
+            time.sleep(0.01)
+
+        return answer, False
 
     def on_grbl_send_command(self):
         cmd = self.ui.grbl_command_entry.get_value()
@@ -1324,13 +1616,15 @@ class ToolLevelling(CNCjob, AppTool):
 
         self.app.worker_task.emit({'fcn': worker_task, 'params': []})
 
-    def send_grbl_command(self, command, echo=True):
+    def send_grbl_command(self, command, echo=True, timeout=30.0):
         """
 
         :param command: GCode command
         :type command:  str
-        :param echo:    if to send a '\n' char after
+        :param echo:    if to print the command and the answer in the shell
         :type echo:     bool
+        :param timeout: for how long to wait for an acknowledgement, in seconds
+        :type timeout:  float
         :return:        the text returned by the GRBL controller after each command
         :rtype:         str
         """
@@ -1341,21 +1635,16 @@ class ToolLevelling(CNCjob, AppTool):
         # Send Gcode command to GRBL
         snd = cmd + '\n'
         self.grbl_ser_port.write(snd.encode('utf-8'))
-        grbl_out = self.grbl_ser_port.readlines()
-        if not grbl_out:
+        answer, acknowledged = self.grbl_read_reply(timeout=timeout)
+
+        if not answer:
             self.app.inform_shell[str, bool].emit('\t\t\t: No answer\n', False)
 
-        result = ''
-        for line in grbl_out:
-            if echo:
-                try:
-                    self.app.inform_shell.emit('\t\t\t: ' + line.decode('utf-8').strip().upper())
-                except Exception as e:
-                    self.app.log.error("CNCJobObject.send_grbl_command() --> %s" % str(e))
-            if 'ok' in line:
-                result = grbl_out
+        if echo:
+            for line in answer:
+                self.app.inform_shell.emit('\t\t\t: ' + line.upper())
 
-        return result
+        return '\n'.join(answer) if acknowledged else ''
 
     def send_grbl_block(self, command, echo=True):
         stripped_cmd = command.strip()
@@ -1367,14 +1656,11 @@ class ToolLevelling(CNCjob, AppTool):
             # Send Gcode block to GRBL
             snd = grbl_line + '\n'
             self.grbl_ser_port.write(snd.encode('utf-8'))
-            grbl_out = self.grbl_ser_port.readlines()
+            answer, _ack = self.grbl_read_reply()
 
-            for line in grbl_out:
-                if echo:
-                    try:
-                        self.app.inform_shell.emit(' : ' + line.decode('utf-8').strip().upper())
-                    except Exception as e:
-                        self.app.log.error("CNCJobObject.send_grbl_block() --> %s" % str(e))
+            if echo:
+                for line in answer:
+                    self.app.inform_shell.emit(' : ' + line.upper())
 
     def on_grbl_get_parameter(self, param):
         if '$' in param:
@@ -1382,9 +1668,8 @@ class ToolLevelling(CNCjob, AppTool):
 
         snd = '$$\n'
         self.grbl_ser_port.write(snd.encode('utf-8'))
-        grbl_out = self.grbl_ser_port.readlines()
-        for line in grbl_out:
-            decoded_line = line.decode('utf-8')
+        answer, _ack = self.grbl_read_reply()
+        for decoded_line in answer:
             par = '$%s' % str(param)
             if par in decoded_line:
                 result = float(decoded_line.rpartition('=')[2])
@@ -1732,21 +2017,45 @@ class ToolLevelling(CNCjob, AppTool):
             self.app.inform.emit('[ERROR_NOTCL] %s: %s' % (_("Failed to open height map file"), filename))
             return
 
-        idx = 0
-        if stream is not None and stream != '':
-            for line in stream:
-                if line != '':
-                    idx += 1
-                    line = line.replace(' ', ',').replace('\n', '').split(',')
-                    if idx not in self.al_voronoi_geo_storage:
-                        self.al_voronoi_geo_storage[idx] = {}
-                    self.al_voronoi_geo_storage[idx]['height'] = float(line[2])
-                    if 'point' not in self.al_voronoi_geo_storage[idx]:
-                        x = float(line[0])
-                        y = float(line[1])
-                        self.al_voronoi_geo_storage[idx]['point'] = Point((x, y))
+        if not stream:
+            self.app.inform.emit('[ERROR_NOTCL] %s: %s' % (_("Empty file"), filename))
+            return
 
-            self.build_al_table_sig.emit()
+        probed_points = []
+        for line in stream:
+            if not line.strip():
+                continue
+            parts = [p for p in line.replace(' ', ',').replace('\n', '').split(',') if p != '']
+            try:
+                probed_points.append((float(parts[0]), float(parts[1]), float(parts[2])))
+            except (IndexError, ValueError):
+                self.app.inform.emit('[ERROR_NOTCL] %s: %s' % (_("Failed to parse height map file"), filename))
+                return
+
+        if not probed_points:
+            self.app.inform.emit('[ERROR_NOTCL] %s: %s' % (_("Empty file"), filename))
+            return
+
+        self.store_probed_points(probed_points)
+        self.build_al_table_sig.emit()
+        self.autolevell_gcode()
+
+    def store_probed_points(self, probed_points):
+        """
+        Store the probed heights in both the Voronoi and the bilinear storage. The Voronoi cells that were already
+        calculated are kept.
+
+        :param probed_points:   list of (x, y, height) tuples, in the order in which the points were probed
+        :type probed_points:    list
+        """
+        self.al_bilinear_geo_storage = [(x, y, height) for x, y, height in probed_points]
+
+        for idx, (x, y, height) in enumerate(probed_points, 1):
+            if idx not in self.al_voronoi_geo_storage:
+                self.al_voronoi_geo_storage[idx] = {'point': Point((x, y)), 'geo': None}
+            self.al_voronoi_geo_storage[idx]['height'] = height
+            if 'point' not in self.al_voronoi_geo_storage[idx]:
+                self.al_voronoi_geo_storage[idx]['point'] = Point((x, y))
 
     def on_grbl_autolevel(self):
         # show the Shell Dock
@@ -1759,27 +2068,38 @@ class ToolLevelling(CNCjob, AppTool):
                 probe_fr = str(self.ui.feedrate_probe_entry.get_value())
                 pr_depth = str(self.ui.pdepth_entry.get_value())
 
-                cmd = 'G21\n'
+                cmd = {'IN': 'G20', 'MM': 'G21'}[self.units]
                 self.send_grbl_command(command=cmd)
-                cmd = 'G90\n'
+                cmd = 'G90'
                 self.send_grbl_command(command=cmd)
 
-                for pt_key in self.al_voronoi_geo_storage:
-                    x = str(self.al_voronoi_geo_storage[pt_key]['point'].x)
-                    y = str(self.al_voronoi_geo_storage[pt_key]['point'].y)
-
-                    cmd = 'G0 Z%s\n' % pr_travelz
+                probed_points = []
+                for x, y in self.probe_points():
+                    cmd = 'G0 Z%s' % pr_travelz
                     self.send_grbl_command(command=cmd)
-                    cmd = 'G0 X%s Y%s\n' % (x, y)
+                    cmd = 'G0 X%s Y%s' % (str(x), str(y))
                     self.send_grbl_command(command=cmd)
                     cmd = 'G38.2 Z%s F%s' % (pr_depth, probe_fr)
-                    output = self.send_grbl_command(command=cmd)
+                    output = self.send_grbl_command(command=cmd, timeout=120.0)
 
                     self.grbl_probe_result += output + '\n'
 
-                cmd = 'M2\n'
+                    height = self.parse_probe_answer(output)
+                    if height is None:
+                        self.app.inform.emit(
+                            '[ERROR_NOTCL] %s: %s, %s' % (_("Probing failed in point"), str(x), str(y))
+                        )
+                        return
+                    probed_points.append((x, y, height))
+
+                cmd = 'G0 Z%s' % pr_travelz
+                self.send_grbl_command(command=cmd)
+                cmd = 'M2'
                 self.send_grbl_command(command=cmd)
                 self.app.inform.emit('%s' % _("Finished probing. Doing the autolevelling."))
+
+                self.store_probed_points(probed_points)
+                self.build_al_table_sig.emit()
 
                 # apply autolevelling here
                 self.on_grbl_apply_autolevel()
@@ -1830,8 +2150,142 @@ class ToolLevelling(CNCjob, AppTool):
             self.app.inform.emit('[ERROR_NOTCL] %s' % _("Empty GRBL heightmap."))
 
     def on_grbl_apply_autolevel(self):
-        # TODO here we call the autolevell method
-        self.app.inform.emit('%s' % _("Finished autolevelling."))
+        self.autolevell_gcode()
+
+    def on_grbl_send_job(self):
+        """
+        Send the GCode of the selected CNCJob object to the GRBL controller, one line at a time.
+        """
+        target_obj = self.app.collection.get_by_name(self.ui.object_combo.get_value())
+        if target_obj is None:
+            self.app.inform.emit('[ERROR_NOTCL] %s' % _("Could not retrieve object"))
+            return
+
+        try:
+            job_gcode = target_obj.source_file
+        except AttributeError:
+            job_gcode = ''
+
+        if not job_gcode:
+            self.app.inform.emit('[ERROR_NOTCL] %s' % _("There is no GCode to send."))
+            return
+
+        if self.grbl_ser_port is None or not self.grbl_ser_port.is_open:
+            self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller is not connected."))
+            return
+
+        # show the Shell Dock
+        self.app.ui.shell_dock.show()
+
+        self.grbl_job_stop = False
+        self.ui.grbl_send_job_button.setDisabled(True)
+        self.ui.grbl_stop_job_button.setDisabled(False)
+
+        def worker_task():
+            with self.app.proc_container.new('%s...' % _("Sending")):
+                self.grbl_stream_gcode(job_gcode)
+
+        self.app.worker_task.emit({'fcn': worker_task, 'params': []})
+
+    def on_grbl_job_progress(self, text):
+        self.ui.grbl_job_progress_label.set_value(text)
+
+    def on_grbl_job_finished(self):
+        self.ui.grbl_send_job_button.setDisabled(False)
+        self.ui.grbl_stop_job_button.setDisabled(True)
+
+    def on_grbl_stop_job(self):
+        """
+        Hold the machine and stop sending the job.
+        """
+        self.grbl_job_stop = True
+        try:
+            # feed hold; the job is not resumed, the remaining lines are not sent
+            self.send_grbl_command(command='!', echo=False)
+        except Exception as e:
+            self.app.log.error("ToolLevelling.on_grbl_stop_job() --> %s" % str(e))
+        self.app.inform.emit('[WARNING_NOTCL] %s' % _("Sending the job was stopped."))
+
+    def grbl_stream_gcode(self, job_gcode):
+        """
+        Send a GCode program to the GRBL controller waiting for each line to be acknowledged before sending the
+        next one.
+
+        :param job_gcode:   the GCode program
+        :type job_gcode:    str
+        """
+        lines = []
+        for line in job_gcode.splitlines():
+            stripped_line = line.strip()
+            # GRBL has no use for empty lines or for comments
+            if not stripped_line or stripped_line.startswith('(') or stripped_line.startswith(';'):
+                continue
+            lines.append(stripped_line)
+
+        total = len(lines)
+        self.app.inform.emit('%s: %d' % (_("Sending the job to the GRBL controller. Lines"), total))
+
+        try:
+            for idx, line in enumerate(lines, 1):
+                if self.grbl_job_stop is True:
+                    return
+
+                # a paused machine is given time to be resumed before the next line is sent
+                while self.ui.pause_resume_button.isChecked() and self.grbl_job_stop is False:
+                    time.sleep(0.2)
+
+                if self.grbl_job_stop is True:
+                    return
+
+                self.grbl_ser_port.write((line + '\n').encode('utf-8'))
+                answer, acknowledged = self.grbl_read_reply(timeout=self.grbl_job_line_timeout)
+
+                # a job has many lines therefore the progress is not reported for every one of them
+                if idx == total or idx % 25 == 0:
+                    self.grbl_job_progress_sig.emit('%s: %d / %d' % (_("Line"), idx, total))
+
+                if not acknowledged:
+                    for answer_line in answer:
+                        self.app.inform_shell.emit('\t\t\t: ' + answer_line.upper())
+                    self.app.inform.emit(
+                        '[ERROR_NOTCL] %s %d: %s' % (_("The GRBL controller rejected the line"), idx, line)
+                    )
+                    return
+
+            self.app.inform.emit('[success] %s' % _("The job was sent to the GRBL controller."))
+        except Exception as e:
+            self.app.log.error("ToolLevelling.grbl_stream_gcode() --> %s" % str(e))
+            self.app.inform.emit('[ERROR_NOTCL] %s: %s' % (_("Sending the job failed"), str(e)))
+        finally:
+            self.grbl_job_finished_sig.emit()
+
+    def probe_points(self):
+        """
+        The (x, y) points that are to be probed, taken from the storage of the active levelling method.
+
+        :return:    list of (x, y) tuples
+        :rtype:     list
+        """
+        if self.ui.al_method_radio.get_value() == 'b':
+            return [(pt[0], pt[1]) for pt in self.al_bilinear_geo_storage]
+        return [
+            (val['point'].x, val['point'].y) for val in self.al_voronoi_geo_storage.values()
+        ]
+
+    def parse_probe_answer(self, answer):
+        """
+        Extract the probed height from the answer of the GRBL controller. A probe that did not touch the material is
+        reported by GRBL with a success flag of zero.
+
+        :param answer:  the answer of the controller to a G38.2 command
+        :type answer:   str
+        :return:        the probed height or None if the probe did not trigger
+        :rtype:         float
+        """
+        match = self.prb_re.search(answer or '')
+        if not match or match.group(4) == '0':
+            return None
+        return float(match.group(3))
 
     def ui_connect(self):
         self.ui.al_add_button.clicked.connect(self.on_add_al_probepoints)
@@ -2430,6 +2884,25 @@ class LevelUI:
         )
         grbl_send_grid.addWidget(self.grbl_report_button, 10, 0, 1, 2)
 
+        # SEND THE JOB
+        self.grbl_send_job_button = FCButton(_("Send Job"))
+        self.grbl_send_job_button.setToolTip(
+            _("Will send the GCode of the selected CNCJob object\n"
+              "to the GRBL controller, line by line.")
+        )
+        grbl_send_grid.addWidget(self.grbl_send_job_button, 11, 0)
+
+        self.grbl_stop_job_button = QtWidgets.QToolButton()
+        self.grbl_stop_job_button.setText(_("Stop"))
+        self.grbl_stop_job_button.setToolTip(
+            _("Will hold the machine and stop sending the job.")
+        )
+        self.grbl_stop_job_button.setDisabled(True)
+        grbl_send_grid.addWidget(self.grbl_stop_job_button, 11, 1)
+
+        self.grbl_job_progress_label = FCLabel('')
+        grbl_send_grid.addWidget(self.grbl_job_progress_label, 12, 0, 1, 2)
+
         hm_lay = QtWidgets.QHBoxLayout()
         # GET HEIGHT MAP
         self.grbl_get_heightmap_button = FCButton(_("Apply AutoLevelling"))
@@ -2447,7 +2920,7 @@ class LevelUI:
         )
         hm_lay.addWidget(self.grbl_save_height_map_button, stretch=0, alignment=Qt.AlignmentFlag.AlignRight)
 
-        grbl_send_grid.addLayout(hm_lay, 12, 0, 1, 2)
+        grbl_send_grid.addLayout(hm_lay, 14, 0, 1, 2)
 
         self.grbl_frame.hide()
         # #############################################################################################################

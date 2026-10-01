@@ -155,6 +155,10 @@ class CNCJobObject(FlatCAMObj, CNCjob):
         # (like the one in the TCL Command), False
         self.multitool = False
 
+        # set by the Levelling plugin after the probed heights were applied over the GCode. It keeps the heights
+        # from being added a second time over a GCode that is already levelled.
+        self.is_levelled_gcode = False
+
         self.multigeo = False
 
         self.coords_decimals = 4

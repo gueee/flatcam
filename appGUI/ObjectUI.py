@@ -1425,8 +1425,6 @@ class CNCObjectUI(ObjectUI):
             _("Generate CNC Code with auto-levelled paths.")
         )
         self.custom_box.addWidget(self.autolevel_button)
-        # self.autolevel_button.setDisabled(True)
-        # self.autolevel_button.setToolTip("DISABLED. Work in progress!")
 
         # #############################################################################################################
         # ## Export G-Code ##
