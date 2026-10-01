@@ -10,7 +10,7 @@ CAD program, and create G-Code for Isolation routing.
 
 # Installation instructions
 
-Works with Python version 3.11 or greater and PyQt6.
+Works with Python version 3.12 or greater and PyQt6.
 
 More on the YouTube channel: 
 https://www.youtube.com/playlist?list=PLVvP2SYRpx-AQgNlfoxw93tXUXon7G94_
@@ -45,6 +45,33 @@ mamba activate flatcam
 ```bash
 python flatcam.py
 ```
+
+
+## Building the Windows installer
+
+The build produces `dist\FlatCAM\FlatCAM.exe`, which runs without a Python installation, and
+`dist\FlatCAM_EVO_Setup.exe`, which installs it with a Start Menu entry and an uninstaller.
+
+Needed:
+
+- Python 3.12 or later, with the packages from `requirements.txt` and `pyinstaller`
+- [Inno Setup 6](https://jrsoftware.org/isdl.php) for the `Setup.exe`
+
+```powershell
+python -m pip install -r requirements.txt pyinstaller
+.\packaging\build_win.ps1
+```
+
+Use `-Python` to point at a specific interpreter and `-SkipInstaller` to build only the application
+folder:
+
+```powershell
+.\packaging\build_win.ps1 -Python .\.venv\Scripts\python.exe -SkipInstaller
+```
+
+GDAL, rasterio and OR-Tools are bundled only when they can be imported in the build environment,
+because their native parts are awkward to install on Windows. Without them the application still
+runs: the Image plugin and the path optimization are the parts that need them.
 
 
 ## Old Instructions

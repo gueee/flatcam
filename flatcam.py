@@ -14,7 +14,7 @@ from appGUI.GUIElements import FCMessageBox
 from multiprocessing import freeze_support
 
 MIN_VERSION_MAJOR = 3
-MIN_VERSION_MINOR = 6
+MIN_VERSION_MINOR = 12
 
 
 def debug_trace():
@@ -76,7 +76,7 @@ if __name__ == '__main__':
     v_msg = "FlatCAM Evo uses PYTHON 3 or later. The version minimum is %s.%s\n"\
             "Your Python version is: %s.%s" % (MIN_VERSION_MAJOR, MIN_VERSION_MINOR, str(major_v), str(minor_v))
 
-    # Supported Python version is >= 3.6
+    # Supported Python version is >= 3.12
     if major_v < MIN_VERSION_MAJOR or (major_v >= MIN_VERSION_MAJOR and minor_v < MIN_VERSION_MINOR):
         print(v_msg)
         msg = '%s\n' % str(datetime.today())

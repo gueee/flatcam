@@ -5,6 +5,10 @@ build/
 /venv/
 /venv/
 
+# Windows build output
+/dist/
+.venv*/
+
 # General for macOS
 .DS_Store
 .AppleDouble
