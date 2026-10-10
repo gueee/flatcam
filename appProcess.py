@@ -8,6 +8,7 @@
 
 from appGUI.GUIElements import FlatCAMActivityView
 from PyQt6 import QtCore
+import traceback
 import weakref
 
 import gettext
@@ -50,9 +51,7 @@ class FCProcess(object):
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type is not None:
             self.app.log.error("Abnormal termination of process!")
-            self.app.log.error(exc_type)
-            self.app.log.error(exc_val)
-            self.app.log.error(exc_tb)
+            self.app.log.error("".join(traceback.format_exception(exc_type, exc_val, exc_tb)))
 
         self.done()
 

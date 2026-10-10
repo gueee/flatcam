@@ -3101,15 +3101,15 @@ class ToolIsolation(Gerber, AppTool):
             self.app.log.error('ToolIsolation.generate_envelope() --> %s' % str(e))
             return 'fail'
 
-        if isinstance(geom_shp, (MultiPolygon, MultiLineString)):
-            geom = geom_shp.geoms
-        else:
-            geom = geom_shp
+        geom = geom_shp
 
         if invert:
             try:
                 pl = []
-                for p in geom:
+                # only the parts of a multi part geometry can have their coordinates reversed; the sequence of the
+                # parts is not a geometry itself therefore it may not end up in the returned value
+                w_geo = geom_shp.geoms if isinstance(geom_shp, (MultiPolygon, MultiLineString)) else geom_shp
+                for p in w_geo:
                     if p is not None:
                         if isinstance(p, Polygon):
                             pl.append(Polygon(p.exterior.coords[::-1], p.interiors))
