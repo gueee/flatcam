@@ -33,6 +33,7 @@ from appEditors.appTextEditor import AppTextEditor
 from camlib import CNCjob
 
 import time
+import threading
 import serial
 import glob
 import random
@@ -276,6 +277,7 @@ class ToolLevelling(CNCjob, AppTool):
         self.ui.zero_axs_wdg.grbl_zeroz_button.clicked.connect(lambda: self.on_grbl_zero(axis='z'))
         self.ui.zero_axs_wdg.grbl_zero_all_button.clicked.connect(lambda: self.on_grbl_zero(axis='all'))
         self.ui.zero_axs_wdg.grbl_homing_button.clicked.connect(self.on_grbl_homing)
+        self.ui.probe_z_button.clicked.connect(self.on_grbl_probe_z)
 
         # Sender
         self.ui.grbl_report_button.clicked.connect(lambda: self.send_grbl_command(command='?'))
@@ -344,6 +346,9 @@ class ToolLevelling(CNCjob, AppTool):
             "tools_al_columns":                 self.ui.al_columns_entry,
             "tools_al_grbl_jog_step":           self.ui.jog_step_entry,
             "tools_al_grbl_jog_fr":             self.ui.jog_fr_entry,
+            "tools_al_grbl_probe_travel":       self.ui.probe_travel_entry,
+            "tools_al_grbl_probe_fr":           self.ui.probe_fr_entry,
+            "tools_al_grbl_plate_thickness":    self.ui.plate_thickness_entry,
         })
 
         # Fill Form fields
@@ -392,15 +397,15 @@ class ToolLevelling(CNCjob, AppTool):
 
         self.build_tool_ui()
 
-        if loaded_obj and loaded_obj.is_segmented_gcode is True and loaded_obj.obj_options["type"] == 'Geometry':
-            self.ui.al_frame.setDisabled(False)
+        if self.can_be_levelled(loaded_obj):
+            self.on_levelling_available(True)
             self.ui.al_mode_radio.set_value(loaded_obj.obj_options['tools_al_mode'])
             self.on_controller_change()
 
             self.on_mode_radio(val=loaded_obj.obj_options['tools_al_mode'])
             self.on_method_radio(val=loaded_obj.obj_options['tools_al_method'])
         else:
-            self.ui.al_frame.setDisabled(True)
+            self.on_levelling_available(False)
 
         self.on_avoid_exc_holes(self.app.options["tools_al_avoid_exc_holes"])
 
@@ -416,10 +421,8 @@ class ToolLevelling(CNCjob, AppTool):
             self.app.inform.emit('[ERROR_NOTCL] %s: %s' % (_("Could not retrieve object"), str(obj_name)))
             return
 
-        if target_obj is not None and target_obj.is_segmented_gcode is True and \
-                target_obj.obj_options["type"] == 'Geometry':
-
-            self.ui.al_frame.setDisabled(False)
+        if self.can_be_levelled(target_obj):
+            self.on_levelling_available(True)
 
             # Shapes container for the Voronoi cells in Autolevelling
             if self.app.use_3d_engine:
@@ -428,7 +431,42 @@ class ToolLevelling(CNCjob, AppTool):
             else:
                 self.probing_shapes = ShapeCollectionLegacy(obj=self, app=self.app, name=obj_name + "_probing_shapes")
         else:
-            self.ui.al_frame.setDisabled(True)
+            self.on_levelling_available(False)
+
+    @staticmethod
+    def can_be_levelled(cnc_obj):
+        """
+        Whether the GCode of a CNCJob object can have the probed heights applied over it. Only a job that was
+        made out of a Geometry object with segmented GCode has moves short enough to be corrected.
+
+        :param cnc_obj: the object to check
+        :type cnc_obj:  class
+        :return:        True when the job can be levelled
+        :rtype:         bool
+        """
+        return cnc_obj is not None and cnc_obj.is_segmented_gcode is True and \
+            cnc_obj.obj_options["type"] == 'Geometry'
+
+    def on_levelling_available(self, available):
+        """
+        Enable the parts of the panel that only make sense for a job that can be levelled. The controller
+        section is not one of them: connecting to the machine, jogging it and sending a job work for any kind
+        of CNC job.
+
+        :param available:   whether the selected object can be levelled
+        :type available:    bool
+        """
+        self.ui.al_frame.setDisabled(not available)
+        self.ui.al_frame2.setDisabled(not available)
+
+        if available:
+            self.build_al_table()
+        else:
+            # probe points left over from an earlier object must not make these look usable
+            self.ui.grbl_get_heightmap_button.setDisabled(True)
+            self.ui.grbl_save_height_map_button.setDisabled(True)
+            self.ui.h_gcode_button.setDisabled(True)
+            self.ui.view_h_gcode_button.setDisabled(True)
 
     def on_object_selection_changed(self, current, previous):
         found_idx = None
@@ -1746,6 +1784,22 @@ class ToolLevelling(CNCjob, AppTool):
 
         self.send_grbl_command(command=cmd, echo=False)
 
+    @staticmethod
+    def grbl_zero_command(axis):
+        """
+        The command that makes the position the machine is at the origin of the work coordinate system.
+
+        L20 is used and not L2: L2 sets the offset of a coordinate system to a machine position, which would
+        move the origin to wherever the machine was homed and throw away the origin of the job. P0 addresses
+        the coordinate system that is in use instead of always G54.
+
+        :param axis:    'x', 'y', 'z' or anything else for all of them
+        :type axis:     str
+        :return:        the GCode command
+        :rtype:         str
+        """
+        return 'G10 L20 P0 %s' % {'x': 'X0', 'y': 'Y0', 'z': 'Z0'}.get(axis, 'X0 Y0 Z0')
+
     def on_grbl_zero(self, axis):
         current_mode = self.on_grbl_get_parameter('10')
         if current_mode is None:
@@ -1754,20 +1808,86 @@ class ToolLevelling(CNCjob, AppTool):
         cmd = '$10=0'
         self.send_grbl_command(command=cmd, echo=False)
 
-        if axis == 'x':
-            cmd = 'G10 L2 P1 X0'
-        elif axis == 'y':
-            cmd = 'G10 L2 P1 Y0'
-        elif axis == 'z':
-            cmd = 'G10 L2 P1 Z0'
-        else:
-            # all
-            cmd = 'G10 L2 P1 X0 Y0 Z0'
-        self.send_grbl_command(command=cmd, echo=False)
+        self.send_grbl_command(command=self.grbl_zero_command(axis), echo=False)
 
         # restore previous mode
         cmd = '$10=%d' % int(current_mode)
         self.send_grbl_command(command=cmd, echo=False)
+
+    @staticmethod
+    def grbl_probe_z_commands(units, travel, feedrate, thickness, lift):
+        """
+        The commands that set the length of the tool by touching the surface with it.
+
+        The probing move is relative because the tool can be at any height above the surface. The distance mode
+        is set back to absolute before the origin is set, so that a command that follows cannot be taken as a
+        relative move.
+
+        :param units:       'MM' or 'IN'
+        :type units:        str
+        :param travel:      how far down to probe at most
+        :type travel:       str
+        :param feedrate:    feedrate of the probing move
+        :type feedrate:     str
+        :param thickness:   the Z that the touch point is given
+        :type thickness:    str
+        :param lift:        the height to pull the tool up to afterwards
+        :type lift:         str
+        :return:            the GCode commands, in the order they are to be sent
+        :rtype:             list
+        """
+        return [
+            {'IN': 'G20', 'MM': 'G21'}[units],
+            'G91 G38.2 Z-%s F%s' % (travel, feedrate),
+            'G90',
+            'G10 L20 P0 Z%s' % thickness,
+            'G0 Z%s' % lift
+        ]
+
+    def on_grbl_probe_z(self):
+        """
+        Probe down for the surface and make the touch point the Z origin, which sets the length of the tool
+        that was just mounted.
+        """
+        if self.grbl_ser_port is None or not self.grbl_ser_port.is_open:
+            self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller is not connected."))
+            return
+
+        # show the Shell Dock
+        self.app.ui.shell_dock.show()
+
+        commands = self.grbl_probe_z_commands(
+            units=self.units,
+            travel=str(self.ui.probe_travel_entry.get_value()),
+            feedrate=str(self.ui.probe_fr_entry.get_value()),
+            thickness=str(self.ui.plate_thickness_entry.get_value()),
+            lift=str(self.app.options["tools_al_grbl_travelz"])
+        )
+
+        def probe_task():
+            self.app.inform.emit('%s' % _("Probing for the surface."))
+
+            for command in commands:
+                output = self.send_grbl_command(command=command, timeout=120.0)
+                if not output:
+                    self.app.inform.emit('[ERROR_NOTCL] %s: %s' % (_("The GRBL controller rejected the line"),
+                                                                   command))
+                    return
+
+                if command.startswith('G91') and self.parse_probe_answer(output) is None:
+                    # the probe did not touch anything; the controller is in an alarm state and the distance
+                    # mode is still relative, therefore nothing more is sent
+                    self.app.inform.emit(
+                        '[ERROR_NOTCL] %s' % _("The probe did not touch the surface. Unlock the controller "
+                                               "with $X and set the distance mode back with G90.")
+                    )
+                    return
+
+            self.app.inform.emit('[success] %s' % _("The tool length was set."))
+
+        # a thread of its own and not a worker task: the worker that streams a job holds one of the few threads
+        # of the pool, and a probe that is queued there would only run after the job was continued
+        threading.Thread(target=probe_task, daemon=True).start()
 
     def on_grbl_homing(self):
         cmd = '$H'
@@ -2226,6 +2346,7 @@ class ToolLevelling(CNCjob, AppTool):
         self.ui.grbl_stop_job_button.setDisabled(False)
         self.ui.grbl_continue_button.setDisabled(True)
         self.ui.grbl_resume_job_button.setDisabled(True)
+        self.on_grbl_manual_control(False)
 
         def worker_task():
             with self.app.proc_container.new('%s...' % _("Sending")):
@@ -2250,6 +2371,37 @@ class ToolLevelling(CNCjob, AppTool):
         self.ui.grbl_job_progress_label.set_value(message)
         self.app.inform.emit('[WARNING_NOTCL] %s' % message)
 
+        # the machine stands still and the streaming thread is not reading the port, therefore the tool can be
+        # changed, the machine jogged and the new tool touched off
+        self.on_grbl_manual_control(True)
+
+    def on_grbl_manual_control(self, enabled):
+        """
+        Everything that moves the machine or reads an answer from it by hand goes through send_grbl_command,
+        which reads the replies of the controller. One of those pressed while a job streams would consume an
+        acknowledgement that the streaming thread counts on, therefore they are only usable when the machine
+        is not being fed.
+
+        Stop, Pause/Resume and the controller Reset are not in this set: they write to the port without
+        reading it and have to stay reachable at all times.
+
+        :param enabled: whether the machine may be operated by hand
+        :type enabled:  bool
+        """
+        self.ui.jog_wdg.setDisabled(not enabled)
+        self.ui.zero_axs_wdg.setDisabled(not enabled)
+        self.ui.probe_z_button.setDisabled(not enabled)
+        self.ui.grbl_command_entry.setDisabled(not enabled)
+        self.ui.grbl_send_button.setDisabled(not enabled)
+        self.ui.grbl_report_button.setDisabled(not enabled)
+        self.ui.grbl_parameter_entry.setDisabled(not enabled)
+        self.ui.grbl_get_param_button.setDisabled(not enabled)
+
+        if enabled is False:
+            # probing the surface needs the port to itself; it is not enabled again here because whether it is
+            # usable at all depends on the selected object
+            self.ui.grbl_get_heightmap_button.setDisabled(True)
+
     def on_grbl_continue_job(self):
         """
         Let a job that stopped at a program pause continue.
@@ -2257,13 +2409,10 @@ class ToolLevelling(CNCjob, AppTool):
         if self.grbl_job_waiting is False:
             return
 
-        try:
-            # cycle start; it releases the hold that the program pause put the controller in
-            self.grbl_ser_port.write('~'.encode('utf-8'))
-        except Exception as e:
-            self.app.log.error("ToolLevelling.on_grbl_continue_job() --> %s" % str(e))
-
+        # nothing has to be released: the pause was never sent to the controller, therefore the machine is
+        # only waiting for the next line
         self.ui.grbl_continue_button.setDisabled(True)
+        self.on_grbl_manual_control(False)
         self.grbl_job_waiting = False
         self.app.inform.emit('%s' % _("The job continues."))
 
@@ -2271,6 +2420,12 @@ class ToolLevelling(CNCjob, AppTool):
         self.ui.grbl_send_job_button.setDisabled(False)
         self.ui.grbl_stop_job_button.setDisabled(True)
         self.ui.grbl_continue_button.setDisabled(True)
+
+        # the machine is free again, therefore it can be moved by hand and the levelling of the selected object
+        # is available once more
+        self.on_grbl_manual_control(True)
+        self.on_levelling_available(self.can_be_levelled(
+            self.app.collection.get_by_name(self.ui.object_combo.get_value())))
 
         # a job that did not run to its end can be resumed from the line that follows the last one the
         # controller acknowledged
@@ -2336,17 +2491,23 @@ class ToolLevelling(CNCjob, AppTool):
 
             line = ToolLevelling.comment_re.sub(' ', line).split(';')[0]
             line = ToolLevelling.m6_re.sub(' ', line)
+
+            # the pause word is not sent either: the sender holds the job itself, which leaves the machine Idle
+            # so that it can be jogged and a new tool can be touched off
+            pauses = bool(ToolLevelling.pause_re.search(line))
+            line = ToolLevelling.pause_re.sub(' ', line)
+
             line = ' '.join(line.split())
-            if not line:
+            if not line and not pauses:
                 continue
 
-            prepared.append((line, pending_message, bool(ToolLevelling.pause_re.search(line))))
+            prepared.append((line, pending_message, pauses))
             pending_message = None
 
         return prepared
 
     @staticmethod
-    def grbl_resume_preamble(sent_lines):
+    def grbl_resume_preamble(sent_lines, modal_only=False):
         """
         The commands that restore the state of the controller before a job is resumed from somewhere in the
         middle of it. The lines that are skipped carry that state and are scanned for it.
@@ -2356,6 +2517,10 @@ class ToolLevelling(CNCjob, AppTool):
 
         :param sent_lines:  the lines of the job that are skipped, as they come out of grbl_prepare_job()
         :type sent_lines:   list
+        :param modal_only:  only the modal commands, which is what a job that waited at a program pause needs:
+                            it was never interrupted, but the operator may have left the controller in another
+                            distance or units mode
+        :type modal_only:   bool
         :return:            the commands to send before the job continues
         :rtype:             list
         """
@@ -2369,6 +2534,9 @@ class ToolLevelling(CNCjob, AppTool):
                 if in_line:
                     preamble.append(in_line)
                     break
+
+        if modal_only:
+            return preamble
 
         for line in reversed(upper_lines):
             found = ToolLevelling.feed_re.search(line)
@@ -2482,15 +2650,40 @@ class ToolLevelling(CNCjob, AppTool):
             # the controller has something to say that is not about the line that was sent
             self.app.inform_shell.emit('\t\t\t: %s' % response.upper())
 
-    def grbl_wait_for_hold(self, timeout=120.0):
+    def grbl_read_status(self, timeout=2.0):
         """
-        Poll the controller until it reports that it holds, which is what it does once it worked through
-        everything that was sent to it and executed the program pause. Nothing may be waiting for an
-        acknowledgement when this is called because the status reports are read from the same port.
+        The state that the controller reports. Nothing may be waiting for an acknowledgement when this is
+        called because the status reports are read from the same port.
+
+        :param timeout: for how long to wait for the report, in seconds
+        :type timeout:  float
+        :return:        the state in lower case, 'idle', 'run', 'hold:0' or 'alarm' for instance, or None when
+                        the controller did not report in time
+        :rtype:         str or None
+        """
+        deadline = time.monotonic() + timeout
+
+        # a status report is asked for; it is a realtime command that is not acknowledged with 'ok'
+        self.grbl_ser_port.write('?'.encode('utf-8'))
+
+        while time.monotonic() < deadline:
+            time.sleep(0.1)
+
+            for response in self.grbl_decode(self.grbl_ser_port.readlines()):
+                stripped = response.strip()
+                if stripped.startswith('<'):
+                    return stripped[1:].split('|')[0].strip().lower()
+
+        return None
+
+    def grbl_wait_for_idle(self, timeout=120.0):
+        """
+        Poll the controller until it stopped moving, which is what it does once it worked through everything
+        that was sent to it. An alarm also ends the wait, because a machine in that state will never reach Idle.
 
         :param timeout: for how long to wait for the machine to come to a stop, in seconds
         :type timeout:  float
-        :return:        True when the controller reported that it holds
+        :return:        True when the machine stopped
         :rtype:         bool
         """
         deadline = time.monotonic() + timeout
@@ -2499,14 +2692,9 @@ class ToolLevelling(CNCjob, AppTool):
             if self.grbl_job_stop is True:
                 return False
 
-            # a status report is asked for; it is a realtime command that is not acknowledged with 'ok'
-            self.grbl_ser_port.write('?'.encode('utf-8'))
-            time.sleep(0.2)
-
-            for response in self.grbl_decode(self.grbl_ser_port.readlines()):
-                low_response = response.lower()
-                if low_response.startswith('<') and ('hold' in low_response or 'door' in low_response):
-                    return True
+            state = self.grbl_read_status()
+            if state is not None and (state.startswith('idle') or state.startswith('alarm')):
+                return True
 
         return False
 
@@ -2520,7 +2708,7 @@ class ToolLevelling(CNCjob, AppTool):
         :return:        True when the job may continue
         :rtype:         bool
         """
-        self.grbl_wait_for_hold()
+        self.grbl_wait_for_idle()
 
         if self.grbl_job_stop is True:
             return False
@@ -2534,6 +2722,39 @@ class ToolLevelling(CNCjob, AppTool):
 
         self.grbl_job_waiting = False
         return self.grbl_job_stop is False
+
+    def grbl_resume_after_pause(self, sent_lines, pending):
+        """
+        Put the controller back into the state the job needs after the operator worked at the machine during a
+        program pause.
+
+        :param sent_lines:  the lines of the job that were sent so far
+        :type sent_lines:   list
+        :param pending:     buffers the answers that were read from the port but not consumed yet
+        :type pending:      list
+        :return:            True when the job may continue
+        :rtype:             bool
+        """
+        # a jog, a zeroing or a probe that the operator ran during the pause left answers in the port, and
+        # none of them may be taken for the acknowledgement of a streamed line
+        try:
+            self.grbl_ser_port.reset_input_buffer()
+        except Exception as e:
+            self.app.log.error("ToolLevelling.grbl_resume_after_pause() --> %s" % str(e))
+        del pending[:]
+        self.grbl_rx_partial = b''
+
+        # the operator may have left another distance or units mode in effect, a failed probe leaves G91 for
+        # instance, which would turn the rest of the job into relative moves
+        for command in self.grbl_resume_preamble(sent_lines, modal_only=True):
+            if self.grbl_job_stop is True:
+                return False
+            if not self.send_grbl_command(command=command, timeout=self.grbl_job_line_timeout):
+                self.app.inform.emit(
+                    '[ERROR_NOTCL] %s: %s' % (_("The GRBL controller rejected the line"), command))
+                return False
+
+        return True
 
     def grbl_stream_gcode(self, job_gcode, start_line=1):
         """
@@ -2601,7 +2822,10 @@ class ToolLevelling(CNCjob, AppTool):
                     self.app.inform_shell.emit('%s: %s' % (_("Message"), message))
                     self.grbl_job_progress_sig.emit(message)
 
-                if line.startswith('$'):
+                if not line:
+                    # the line held nothing but a program pause, which is handled below
+                    pass
+                elif line.startswith('$'):
                     # a system command answers with more than an acknowledgement and it is not queued by the
                     # controller, therefore it is sent on its own and its whole answer is read
                     while in_flight:
@@ -2627,12 +2851,29 @@ class ToolLevelling(CNCjob, AppTool):
                     self.grbl_job_progress_sig.emit('%s: %d / %d' % (_("Line"), idx, total))
 
                 if pauses:
-                    # the machine only reaches the pause once it worked through everything that was sent
+                    # the machine only comes to a stop once it worked through everything that was sent
                     while in_flight:
                         if self.grbl_collect_ack(pending, in_flight) is False:
                             return
+                    self.grbl_job_last_ack = idx
 
-                    if self.grbl_wait_for_operator(message) is False:
+                    while True:
+                        if self.grbl_wait_for_operator(message) is False:
+                            return
+
+                        # a job cannot be continued from an alarm: the machine lost its position and every
+                        # move it is given would be refused
+                        state = self.grbl_read_status()
+                        if state is None or not state.startswith('alarm'):
+                            break
+
+                        self.app.inform.emit(
+                            '[ERROR_NOTCL] %s' % _("The controller is in an alarm state. Unlock it with $X, "
+                                                   "set the Z origin again, then continue.")
+                        )
+
+                    sent_lines = [sent for sent, _msg, _p in prepared[:idx]]
+                    if self.grbl_resume_after_pause(sent_lines, pending) is False:
                         return
 
             # the job is only done once the controller acknowledged the last line of it
@@ -2967,10 +3208,12 @@ class LevelUI:
             _("The kind of controller for which to generate\n"
               "height map gcode.")
         )
-        self.al_box.addWidget(self.al_controller_label)
+        # the controller section is not part of self.al_frame: connecting to the machine, jogging it and sending
+        # a job work for any kind of CNC job, not only for one that can be levelled
+        self.tools_box.addWidget(self.al_controller_label)
 
         self.c_frame = FCFrame()
-        self.al_box.addWidget(self.c_frame)
+        self.tools_box.addWidget(self.c_frame)
 
         ctrl_grid = GLay(v_spacing=5, h_spacing=3)
         self.c_frame.setLayout(ctrl_grid)
@@ -3219,6 +3462,63 @@ class LevelUI:
         grbl_ctrl2_grid.addWidget(self.jog_fr_entry, 1, 1)
 
         # #############################################################################################################
+        # Z TOUCH OFF
+        # #############################################################################################################
+        # PROBE TRAVEL
+        self.probe_travel_label = FCLabel('%s:' % _("Probe travel"))
+        self.probe_travel_label.setToolTip(
+            _("How far down the probe is allowed to travel\n"
+              "looking for the surface, starting from where\n"
+              "the tool is now.")
+        )
+
+        self.probe_travel_entry = FCDoubleSpinner()
+        self.probe_travel_entry.set_precision(self.decimals)
+        self.probe_travel_entry.set_range(0.0000, 10000.0000)
+
+        grbl_ctrl2_grid.addWidget(self.probe_travel_label, 2, 0)
+        grbl_ctrl2_grid.addWidget(self.probe_travel_entry, 2, 1)
+
+        # PROBE FEEDRATE
+        self.probe_fr_label = FCLabel('%s:' % _("Probe feedrate"))
+        self.probe_fr_label.setToolTip(
+            _("Feedrate of the downward probing move.\n"
+              "Slow is accurate.")
+        )
+
+        self.probe_fr_entry = FCDoubleSpinner()
+        self.probe_fr_entry.set_precision(self.decimals)
+        self.probe_fr_entry.set_range(0.0000, 10000.0000)
+
+        grbl_ctrl2_grid.addWidget(self.probe_fr_label, 3, 0)
+        grbl_ctrl2_grid.addWidget(self.probe_fr_entry, 3, 1)
+
+        # PLATE THICKNESS
+        self.plate_thickness_label = FCLabel('%s:' % _("Plate thickness"))
+        self.plate_thickness_label.setToolTip(
+            _("The Z that the touch point is given.\n"
+              "It is the thickness of the touch plate, or zero\n"
+              "when the probe clip is on the tool and the\n"
+              "material itself is the contact.")
+        )
+
+        self.plate_thickness_entry = FCDoubleSpinner()
+        self.plate_thickness_entry.set_precision(self.decimals)
+        self.plate_thickness_entry.set_range(0.0000, 100.0000)
+
+        grbl_ctrl2_grid.addWidget(self.plate_thickness_label, 4, 0)
+        grbl_ctrl2_grid.addWidget(self.plate_thickness_entry, 4, 1)
+
+        # PROBE Z
+        self.probe_z_button = FCButton(_("Probe Z"))
+        self.probe_z_button.setToolTip(
+            _("Will probe down for the surface and make the\n"
+              "touch point the Z origin of the work coordinate\n"
+              "system, which sets the length of the tool.")
+        )
+        grbl_ctrl2_grid.addWidget(self.probe_z_button, 5, 0, 1, 2)
+
+        # #############################################################################################################
         # GRBL SENDER
         # #############################################################################################################
         self.sender_frame = FCFrame()
@@ -3344,6 +3644,16 @@ class LevelUI:
         self.grbl_frame.hide()
         # #############################################################################################################
 
+        # the levelling steps that follow the controller section; enabled together with self.al_frame
+        self.al_frame2 = QtWidgets.QFrame()
+        self.al_frame2.setContentsMargins(0, 0, 0, 0)
+        self.tools_box.addWidget(self.al_frame2)
+
+        self.al_box2 = QtWidgets.QVBoxLayout()
+        self.al_box2.setContentsMargins(0, 0, 0, 0)
+        self.al_frame2.setLayout(self.al_box2)
+        self.al_frame2.setDisabled(True)
+
         height_lay = QtWidgets.QHBoxLayout()
         self.h_gcode_button = FCButton(_("Save Probing GCode"))
         self.h_gcode_button.setToolTip(
@@ -3363,7 +3673,7 @@ class LevelUI:
         # height_lay.addStretch()
         height_lay.addWidget(self.view_h_gcode_button)
 
-        self.al_box.addLayout(height_lay)
+        self.al_box2.addLayout(height_lay)
 
         self.import_heights_button = FCButton(_("Import Height Map"))
         self.import_heights_button.setToolTip(
@@ -3372,7 +3682,7 @@ class LevelUI:
               "over the original GCode therefore\n"
               "doing autolevelling.")
         )
-        self.al_box.addWidget(self.import_heights_button)
+        self.al_box2.addWidget(self.import_heights_button)
 
         # self.h_gcode_button.hide()
         # self.import_heights_button.hide()
@@ -3398,6 +3708,14 @@ class LevelUI:
 
         self.plot_probing_pts_cb.stateChanged.connect(self.on_plot_points_changed)
         self.avoid_exc_holes_cb.stateChanged.connect(self.on_avoid_exc_holes_changed)
+
+        # the touch off values are not stored on the object, therefore they are kept in the app options
+        self.probe_travel_entry.valueChanged.connect(
+            lambda val: self.app.options.__setitem__("tools_al_grbl_probe_travel", val))
+        self.probe_fr_entry.valueChanged.connect(
+            lambda val: self.app.options.__setitem__("tools_al_grbl_probe_fr", val))
+        self.plate_thickness_entry.valueChanged.connect(
+            lambda val: self.app.options.__setitem__("tools_al_grbl_plate_thickness", val))
 
     def confirmation_message(self, accepted, minval, maxval):
         if accepted is False:

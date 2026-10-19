@@ -526,6 +526,9 @@ class AppDefaults:
         "tools_al_grbl_jog_step": 5,
         "tools_al_grbl_jog_fr": 1500,
         "tools_al_grbl_travelz": 15.0,
+        "tools_al_grbl_probe_travel": 20.0,
+        "tools_al_grbl_probe_fr": 50,
+        "tools_al_grbl_plate_thickness": 0.0,
 
         # NCC Plugin
         "tools_ncc_tools": "0.5",

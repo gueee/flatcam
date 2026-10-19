@@ -273,7 +273,8 @@ class TestGrblPrepareJob(unittest.TestCase):
         gcode = "T1\n(MSG, Change to Tool Dia = 0.8)\nM0\nG00 Z2.0\n"
         prepared = ToolLevelling.grbl_prepare_job(gcode)
 
-        self.assertEqual([line for line, _m, _p in prepared], ['T1', 'M0', 'G00 Z2.0'])
+        # the pause word is not sent, but it keeps its place in the job so that the sender stops there
+        self.assertEqual([line for line, _m, _p in prepared], ['T1', '', 'G00 Z2.0'])
         self.assertEqual(prepared[1][1], 'Change to Tool Dia = 0.8')
         # the message belongs to one line only
         self.assertIsNone(prepared[0][1])
@@ -281,7 +282,8 @@ class TestGrblPrepareJob(unittest.TestCase):
 
     def test_message_on_the_same_line_as_a_command(self):
         prepared = ToolLevelling.grbl_prepare_job("M0 (MSG, Mount the probe)\n")
-        self.assertEqual(prepared[0][0], 'M0')
+        self.assertEqual(prepared[0][0], '')
+        self.assertTrue(prepared[0][2])
         self.assertEqual(prepared[0][1], 'Mount the probe')
 
     def test_m6_is_taken_out_but_the_rest_of_the_line_is_kept(self):
@@ -291,8 +293,12 @@ class TestGrblPrepareJob(unittest.TestCase):
     def test_a_pause_is_recognized(self):
         prepared = ToolLevelling.grbl_prepare_job("M0\nM01\nM5\nM30\nM09\nG01 X1.0\n")
         self.assertEqual([(line, pauses) for line, _m, pauses in prepared],
-                         [('M0', True), ('M01', True), ('M5', False), ('M30', False),
+                         [('', True), ('', True), ('M5', False), ('M30', False),
                           ('M09', False), ('G01 X1.0', False)])
+
+    def test_a_pause_is_taken_out_but_the_rest_of_the_line_is_kept(self):
+        prepared = ToolLevelling.grbl_prepare_job("T2 M0\n")
+        self.assertEqual(prepared, [('T2', None, True)])
 
 
 class TestGrblResumePreamble(unittest.TestCase):
@@ -320,6 +326,68 @@ class TestGrblResumePreamble(unittest.TestCase):
 
     def test_a_job_that_only_moves_in_xy_gets_no_lift(self):
         self.assertEqual(ToolLevelling.grbl_resume_preamble(['G21', 'G00 X1.0 Y2.0']), ['G21'])
+
+    def test_modal_only_leaves_out_feedrate_spindle_and_lift(self):
+        sent = ['G21', 'G90', 'M03 S12000', 'G00 Z2.0000', 'G01 Z-0.0500 F120.0', 'G54']
+        self.assertEqual(ToolLevelling.grbl_resume_preamble(sent, modal_only=True), ['G21', 'G90', 'G54'])
+
+    def test_modal_only_puts_back_the_absolute_mode_a_failed_probe_left_relative(self):
+        # the operator probed during a tool change, the probe did not touch and G91 stayed in effect
+        preamble = ToolLevelling.grbl_resume_preamble(['G21', 'G90', 'G00 Z15.0'], modal_only=True)
+        self.assertIn('G90', preamble)
+        self.assertNotIn('G00 Z15.0', preamble)
+
+
+class TestGrblZeroCommand(unittest.TestCase):
+    """The command that makes the current position the origin of the work coordinate system."""
+
+    def test_every_axis_on_its_own(self):
+        self.assertEqual(ToolLevelling.grbl_zero_command('x'), 'G10 L20 P0 X0')
+        self.assertEqual(ToolLevelling.grbl_zero_command('y'), 'G10 L20 P0 Y0')
+        self.assertEqual(ToolLevelling.grbl_zero_command('z'), 'G10 L20 P0 Z0')
+
+    def test_all_axes(self):
+        self.assertEqual(ToolLevelling.grbl_zero_command('all'), 'G10 L20 P0 X0 Y0 Z0')
+
+    def test_l2_is_never_used_because_it_would_discard_the_work_origin(self):
+        for axis in ('x', 'y', 'z', 'all'):
+            command = ToolLevelling.grbl_zero_command(axis)
+            self.assertIn('L20', command)
+            self.assertNotIn('L2 ', command)
+            self.assertIn('P0', command)
+
+
+class TestGrblProbeZCommands(unittest.TestCase):
+    """The touch off that sets the length of a newly mounted tool."""
+
+    def test_the_commands_in_mm(self):
+        self.assertEqual(
+            ToolLevelling.grbl_probe_z_commands(units='MM', travel='20.0', feedrate='50.0', thickness='0.0',
+                                                lift='15.0'),
+            ['G21', 'G91 G38.2 Z-20.0 F50.0', 'G90', 'G10 L20 P0 Z0.0', 'G0 Z15.0']
+        )
+
+    def test_the_commands_in_inch(self):
+        commands = ToolLevelling.grbl_probe_z_commands(units='IN', travel='0.8', feedrate='2.0', thickness='0.04',
+                                                       lift='0.6')
+        self.assertEqual(commands[0], 'G20')
+        self.assertEqual(commands[3], 'G10 L20 P0 Z0.04')
+
+    def test_the_probe_move_is_relative_and_absolute_mode_is_back_before_the_origin_is_set(self):
+        commands = ToolLevelling.grbl_probe_z_commands(units='MM', travel='20.0', feedrate='50.0', thickness='0.0',
+                                                       lift='15.0')
+        probe_at = next(i for i, c in enumerate(commands) if 'G38.2' in c)
+        absolute_at = commands.index('G90')
+        origin_at = next(i for i, c in enumerate(commands) if 'G10' in c)
+
+        self.assertIn('G91', commands[probe_at])
+        self.assertLess(probe_at, absolute_at)
+        self.assertLess(absolute_at, origin_at)
+
+    def test_the_plate_thickness_becomes_the_z_of_the_touch_point(self):
+        commands = ToolLevelling.grbl_probe_z_commands(units='MM', travel='20.0', feedrate='50.0', thickness='1.6',
+                                                       lift='15.0')
+        self.assertIn('G10 L20 P0 Z1.6', commands)
 
 
 class TestGrblExtractMessage(unittest.TestCase):

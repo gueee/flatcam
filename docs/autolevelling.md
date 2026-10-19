@@ -104,9 +104,21 @@ for most GRBL boards; use **New** and **Add** if your rate is not listed), then 
 controller actually answers, and the Control and Sender tabs unlock. If it stays red, the port is
 wrong, the board is busy, or another program is holding the port open.
 
-**Control tab.** Jog the machine, zero an axis, run a homing cycle. Use this to set your work zero
-with the probe touching the surface before you start, exactly as you would for any job. **Step** and
-**Feedrate** control the jog increment and speed.
+**Control tab.** Jog the machine, zero an axis, run a homing cycle, touch off a tool. Use this to set
+your work zero before you start, exactly as you would for any job. **Step** and **Feedrate** control
+the jog increment and speed.
+
+The **Zero** buttons make the place the machine stands at right now the origin of the work coordinate
+system. They move nothing and they leave the machine coordinates alone, so jogging the tool down onto
+the surface and pressing **Zero Z** is a complete manual touch-off.
+
+**Probe Z** does the same with the probe instead of your eye. It probes straight down, at most
+**Probe travel** far and at **Probe feedrate**, then gives the point it touched the Z of **Plate
+thickness** and lifts to the travel height. Leave **Plate thickness** at 0 when the clip is on the
+bit and the copper itself is the contact; set it to the thickness of the plate when you probe onto a
+touch plate. Keep the feedrate low, 80 mm/min or less on a Masuter 3S. If the probe touches nothing
+within Probe travel, no origin is set, the failure is reported, and the controller is left in an
+alarm state that `$X` clears.
 
 **Sender tab.** Press **Apply AutoLevelling**. FlatCAM walks every probe point: it lifts to
 Probe Z travel, moves to the point, probes down at Probe Feedrate, and reads the height back from
@@ -192,6 +204,13 @@ levelled one.
 Or send it straight from FlatCAM over the GRBL connection you already have open: on the **Sender**
 tab press **Send Job**. A counter shows the progress as `Line N / total`.
 
+Levelling and sending are separate. The Controller section with its Connect, Control and Sender tabs
+is usable for **any** CNC job, drilling included, and the Source Object dropdown lists all of them.
+Only the probing side of the panel, the probe points table, **Add Probe Points**, **Save Probing
+GCode**, **Import Height Map** and **Apply AutoLevelling**, needs a Geometry job with segmented
+G-code. So a drill job is connected to, jogged, touched off and sent here like any other, it just
+cannot be height-corrected.
+
 Lines are streamed with GRBL's character counting protocol: FlatCAM keeps the controller's 128 byte
 receive buffer filled instead of waiting for each line to be acknowledged before sending the next
 one. This matters for levelled jobs, which are made of thousands of very short segments. Waiting for
@@ -208,6 +227,12 @@ preprocessor talks to the operator.
 | **Stop** | Holds the machine and stops sending. The remaining lines are not sent. |
 | **Continue** | Lets a job that stopped at a program pause, a tool change for instance, carry on. |
 | **Resume from line** | Sends the job again starting at the given line, restoring the state first. |
+
+While a job streams, everything that drives the machine by hand is greyed out: jogging, the Zero
+buttons, homing, **Probe Z**, the custom command box, **Get Report** and **Get Parameter**. They all
+read the controller's replies, and one of those pressed mid-stream would swallow an acknowledgement
+the sender is counting. They come back as soon as the job stops at a program pause or ends. **Stop**,
+**Pause/Resume** and the controller **Reset** stay available at all times.
 
 If the controller reports an `error:` or an `ALARM:`, the stream stops and the message appears in the
 shell together with the line that caused it. Long moves can take a while to acknowledge, which is
@@ -226,22 +251,31 @@ sender, the job dies there. FlatCAM removes the `M6` word before sending and kee
 line, so the `T` number still goes out.
 
 What actually stops the machine is the `M0` that the preprocessors emit right after the tool change
-message. When the sender reaches an `M0` it waits for the controller to report that it holds, shows
-you the preprocessor's message, and enables **Continue**. The machine stays exactly where it is.
-Change the tool, then press **Continue**, which sends a cycle start.
+message. That pause is never sent to the controller. FlatCAM holds the job itself: it waits for the
+machine to come to a stop, shows you the preprocessor's message, and enables **Continue**. The
+machine stays exactly where it is and, because it is idle rather than held, it can be driven by hand.
+GRBL refuses jog commands while it holds, which is why the pause is kept on this side of the port.
+
+So at a tool change you have the whole Control tab: jog the spindle somewhere you can reach, change
+the tool, jog it down onto the surface and press **Zero Z**, or clip the probe on and press
+**Probe Z**. Then press **Continue** and the job carries on from the next line, which is a lift to
+clearance in every preprocessor. The modal state is sent again first, so a probe that failed and left
+the controller in relative mode cannot turn the rest of the job into relative moves. If the
+controller is in an alarm state when you press **Continue**, the job refuses to go on and asks you to
+clear it with `$X` and set Z again, because a machine in alarm has lost its position.
 
 Which tool to mount is in the message itself: `Change to Tool Dia = 0.8`, and for drilling also the
 number of holes that tool will make.
 
 Setting the length of the new tool is the part that has to be right, because a tool that sits 2 mm
-deeper than the previous one cuts 2 mm deeper. Three preprocessors handle it, and all three work on
-GRBL:
+deeper than the previous one cuts 2 mm deeper. You can do it by hand at the pause as described above,
+or let the preprocessor do it. Three preprocessors handle it, and all three work on GRBL:
 
 | Preprocessor | How the tool length is set |
 |---|---|
 | `Toolchange_Probe_GRBL` | Probes the surface with `G38.2` and zeroes Z on it. |
 | `Toolchange_Manual` | You lower the tool onto the material by hand and tighten it there. |
-| `GRBL_11_no_M6` | Not at all; the tool has to go back to the same length as before. |
+| `GRBL_11_no_M6` | Not at all; set it yourself at the pause with **Zero Z** or **Probe Z**. |
 
 `Toolchange_Probe_GRBL` is the one to pick if your machine has a probe input. At every tool change it
 stops for the tool and the probe clip, then touches the surface twice, the second time at half the
@@ -276,7 +310,9 @@ your work zero are gone and have to be set again before resuming means anything.
 ## Troubleshooting
 
 **The Levelling panel is greyed out.** The selected object is not a Geometry CNC job with segmented
-G-code. Regenerate it with **Allow levelling** ticked and non-zero segment sizes.
+G-code. Regenerate it with **Allow levelling** ticked and non-zero segment sizes. The Controller
+section stays usable either way: you can still connect, jog and send the job, you just cannot
+height-correct it.
 
 **"There is no height data."** The probe points exist but all their heights are still zero. Probe
 them, or import a height map, before applying.
@@ -294,13 +330,19 @@ has the port.
 a file you exported and ran in another sender still holds it; use the `GRBL_11_no_M6` or
 `Toolchange_Probe_GRBL` preprocessor for those.
 
-**`ALARM:4` or `ALARM:5` after a tool change.** The probe. `ALARM:5` means the probe never touched
-anything within the probe depth, `ALARM:4` means it was already triggered when the move started.
-Check the clip and that the probe depth reaches past the surface. The controller is in an alarm state
-afterwards: unlock it with `$X` from the Control tab, set the tool length again, then resume.
+**`ALARM:4` or `ALARM:5` after a tool change or a Probe Z.** The probe. `ALARM:5` means it never
+touched anything within the travel, `ALARM:4` means it was already triggered when the move started.
+Check the clip and that the travel reaches past the surface. The controller is in an alarm state
+afterwards and nothing was zeroed: unlock it with `$X` from the Control tab, set the tool length
+again, then continue or resume.
 
-**The job stopped and the machine is holding.** That is a program pause waiting for you. Read the
-message in the shell or the progress label, do what it asks, then press **Continue**.
+**Probe Z did nothing and reported a failure.** Same cause as above. The remaining commands are
+deliberately not sent when the probe does not touch, so the origin keeps the value it had rather than
+being set to a height the machine never reached.
+
+**The job stopped and the machine is standing still.** That is a program pause waiting for you. Read
+the message in the shell or the progress label, do what it asks, which at a tool change may include
+**Zero Z** or **Probe Z**, then press **Continue**.
 
 **Depth is right in the middle and wrong at the edges.** Your probe points do not reach far enough
 out. Add rows and columns, or place manual points nearer the corners. Outside the probed area the
