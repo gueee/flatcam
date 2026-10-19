@@ -127,14 +127,26 @@ class FakeGrbl:
         return '<%s|MPos:%.3f,%.3f,%.3f|FS:0,0|WCO:%.3f,%.3f,%.3f%s>' % (
             self.state, *self.mpos, *self.wco, '|Pn:' + pins if self.hard_limits and pins else '')
 
+    def _alarm_limit(self):
+        self.state = 'Alarm'
+        self.critical = True
+        self._emit('ALARM:1')
+        self._emit('[MSG:Reset to continue]')
+
     def _move(self, target):
-        """Move to the target; past machine 0 the machine runs into a limit switch and stops there."""
+        """
+        Move to the target; past machine 0 the machine runs into a limit switch and stops there. With the hard
+        limits on ($21=1) the switch raises the alarm whenever it changes, also when the machine moves off it.
+        """
+        limits_on = self.hard_limits and self.settings[21] == '1'
+        pressed = self.hard_limits and any(value >= -0.001 for value in self.mpos)
+        if limits_on and pressed and target != self.mpos:
+            self._alarm_limit()
+            return
         if self.hard_limits and any(value > 0.0 for value in target):
             self.mpos = [min(value, 0.0) for value in target]
-            self.state = 'Alarm'
-            self.critical = True
-            self._emit('ALARM:1')
-            self._emit('[MSG:Reset to continue]')
+            if limits_on:
+                self._alarm_limit()
             return
         self.mpos = target
 
@@ -403,6 +415,7 @@ def make_sender(port):
     tool.grbl_status_line = ''
     tool.grbl_homed = False
     tool.grbl_settings = {}
+    tool.grbl_limits_suspended = False
     tool.grbl_poll_partial = b''
     tool.grbl_status_timer = SimpleNamespace(start=lambda: None, stop=lambda: None)
     tool.ui.grbl_wpos_labels = [FakeWidget() for _i in range(3)]
@@ -480,6 +493,20 @@ class TestJogCommands(unittest.TestCase):
                          ['$J=G91 G20 Z0.5 F50.0'])
 
 
+class TestJobTopZ(unittest.TestCase):
+    def test_the_highest_z(self):
+        job = '(Z Start: 40 mm)\nG21\nG90\nG94\nG00 Z5.0\nG01 Z-1.5 F100\nG00 Z15.0 ; end\nM05\n'
+        self.assertEqual(ToolLevelling.grbl_job_top_z(job), 15.0)
+
+    def test_arc_modes_do_not_count_as_relative(self):
+        self.assertEqual(ToolLevelling.grbl_job_top_z('G91.1\nG01 F300.00\nG00 Z2\n'), 2.0)
+
+    def test_heights_that_are_not_known_before_the_job_runs(self):
+        for job in ('G91\nG00 Z5\n', 'G20\nG00 Z0.5\n', 'G92 Z0\nG00 Z5\n', 'G55\nG00 Z5\n', 'G10 L20 P0 Z0\nG0 Z5\n'):
+            self.assertIsNone(ToolLevelling.grbl_job_top_z(job), job)
+        self.assertIsNone(ToolLevelling.grbl_job_top_z('G00 X1 Y1\n'))
+
+
 class TestStatus(unittest.TestCase):
     def setUp(self):
         self.sender = make_sender(FakeGrbl())
@@ -503,6 +530,14 @@ class TestStatus(unittest.TestCase):
         # $10=0 reports the work position
         self.sender.grbl_note_status('<Idle|WPos:1.000,2.000,3.000|FS:0,0|WCO:-10.000,-10.000,-10.000>')
         self.assertEqual(self.sender.grbl_status['mpos'], [-9.0, -8.0, -7.0])
+
+    def test_the_newest_report_counts(self):
+        grbl = self.sender.grbl_ser_port
+        grbl.state = 'Alarm'
+        # a report the position display asked for and that was not read yet
+        grbl.write(b'?')
+        grbl.state = 'Idle'
+        self.assertEqual(self.sender.grbl_read_status(), 'idle')
 
     def test_a_limit_alarm_forgets_the_homing(self):
         self.sender.grbl_homed = True
@@ -785,12 +820,61 @@ class TestLimitSwitches(unittest.TestCase):
 
         self.assertIn('\x18', self.grbl.realtime)
         self.assertEqual(self.grbl.state, 'Idle')
-        self.assertIn('still pressed: X', self.sender.app.inform.text())
+        self.assertIn('pressed: X', self.sender.app.inform.text())
+        # releasing the switch would raise the alarm again
+        self.assertEqual(self.grbl.settings[21], '0')
+
+        # the hard limits stay off while the switch is pressed
+        self.sender.on_grbl_status_tick()
+        time.sleep(0.3)
+        self.sender.on_grbl_status_tick()
+        self.assertTrue(self.sender.grbl_limits_suspended)
 
         # the machine can be jogged off the switch
         self.sender.on_grbl_jog('xminus')
         self.assertEqual(self.grbl.mpos[0], -5.0)
         self.assertFalse(self.grbl.critical)
+
+        # and once it is off, the hard limits are switched on again
+        self.assertTrue(wait_for(lambda: self.tick() and self.grbl.settings[21] == '1'))
+        self.assertFalse(self.sender.grbl_limits_suspended)
+
+    def tick(self):
+        self.sender.on_grbl_status_tick()
+        return True
+
+    def test_jogging_off_a_switch_with_the_hard_limits_on_raises_the_alarm_again(self):
+        # what the controller does when it is only unlocked with $X; the sender switches the limits off for it
+        self.crash()
+        self.sender.grbl_soft_reset()
+        self.assertTrue(self.sender.send_grbl_command('$X', echo=False, timeout=1.0))
+        self.sender.on_grbl_jog('xminus')
+        self.assertTrue(self.grbl.critical)
+
+    def test_a_job_that_goes_above_the_top_is_not_sent(self):
+        # the work Z zero was set 3 mm below the top, the job lifts to 15 mm
+        self.grbl.mpos[2] = -4.0
+        self.sender.on_grbl_zero('z')
+        self.sender.app.collection = SimpleNamespace(
+            get_by_name=lambda name: SimpleNamespace(source_file='G21\nG90\nG00 Z15.0\nG01 Z-1.5 F100\n'))
+        lines_before = len(self.grbl.lines)
+
+        self.sender.on_grbl_send_job()
+
+        self.assertFalse(self.sender.grbl_job_running)
+        self.assertEqual(len(self.grbl.lines), lines_before)
+        self.assertIn('12.000 mm above the top', self.sender.app.inform.text())
+
+    def test_a_job_is_not_sent_in_an_alarm(self):
+        self.crash()
+        self.sender.app.collection = SimpleNamespace(get_by_name=lambda name: SimpleNamespace(source_file='G0 X1\n'))
+        lines_before = len(self.grbl.lines)
+
+        self.sender.on_grbl_send_job()
+
+        self.assertFalse(self.sender.grbl_job_running)
+        self.assertEqual(len(self.grbl.lines), lines_before)
+        self.assertIn('Do Home', self.sender.app.inform.text())
 
 
 class TestPanelState(unittest.TestCase):

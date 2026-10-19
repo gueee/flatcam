@@ -105,6 +105,11 @@ controller actually answers, and the Control and Sender tabs unlock. If it stays
 wrong, the board is busy, or another program is holding the port open. Press it again to disconnect;
 that is refused while a job is being sent.
 
+Connecting restarts most GRBL boards, and with homing enabled (`$22=1`) GRBL starts up locked in an
+alarm even though the machine has not moved. The status bar says so after connecting. Press **Do
+Home**, or **Unlock** to work without homing. Without homing the panel does not know where the limit
+switches are.
+
 A command the controller refuses is never silent: its answer, `error:15` for a jog past the soft
 limits for instance, is printed in the shell, and the status bar says which state the controller was
 in, so you can tell an alarm that needs `$X` or a homing from a hold that needs **Pause/Resume**.
@@ -136,6 +141,12 @@ not known; check the target it shows before you press the button.
 Unlock resets the controller first in that case. **Do Home** also resets first when the controller is
 in an alarm, and it is the better way out: it makes the position known again. Your work zero set with
 the Zero buttons or Probe Z survives the reset.
+
+With hard limits on (`$21=1`), GRBL raises the alarm whenever a limit switch changes, so releasing the
+switch while you jog off it would lock the machine again. When Unlock finds a switch still pressed, it
+therefore switches the hard limits off. The State shows "hard limits off" until you have jogged clear
+of the switch, and then they are switched on again automatically. They are also switched back on when
+you disconnect or send a job, and a job is refused while a switch is pressed.
 
 The **Zero** buttons make the place the machine stands at right now the origin of the work coordinate
 system. They move nothing and they leave the machine coordinates alone, so jogging the tool down onto
@@ -230,8 +241,20 @@ probing data.
 Export the G-code as usual and cut it with whatever sender you prefer. The exported file is the
 levelled one.
 
-Or send it straight from FlatCAM over the GRBL connection you already have open: on the **Sender**
-tab press **Send Job**. A counter shows the progress as `Line N / total`.
+Or send it straight from FlatCAM over the GRBL connection you already have open. This works for any
+CNC job, a drilling job too:
+
+1. Pick the CNC job in the **Source Object** dropdown at the top of the Levelling panel. Selecting it
+   in the project list does the same.
+2. Connect, then home the machine with **Do Home** (or **Unlock**).
+3. Jog to the work origin and set it with the **Zero** buttons or **Probe Z**. Check the **Origin**
+   row and the **Go to origin** line on the Control tab.
+4. On the **Sender** tab press **Send Job**. A counter shows the progress as `Line N / total`.
+
+Send Job refuses to start while the controller is in an alarm or a hold, because it would refuse the
+first line, and the status bar says which button to press. Once the machine was homed, it also refuses
+a job that would move above the top of the machine. A travel or end Z of 15 mm above a work Z zero
+set close to the top would run into the limit switch and end the job with an alarm.
 
 Levelling and sending are separate. The Controller section with its Connect, Control and Sender tabs
 is usable for **any** CNC job, drilling included, and the Source Object dropdown lists all of them.
@@ -372,8 +395,8 @@ the travel the soft limits allow.
 
 **The machine ran into a limit switch.** The State turns red, `ALARM:1` is printed in the shell and the
 switch is shown as pressed. Press **Do Home**: the controller is reset and homed and the position is
-known again. If homing is not possible, press **Unlock** and jog away from the switch in small steps;
-with hard limits on, releasing the switch can raise the alarm again, then home.
+known again. If homing is not possible, press **Unlock** and jog away from the switch. The hard limits
+are off until you are clear of it, so releasing it does not raise the alarm again.
 
 **`error:20` from the controller.** An unsupported command. FlatCAM strips `M6` before sending, but
 a file you exported and ran in another sender still holds it; use the `GRBL_11_no_M6` or

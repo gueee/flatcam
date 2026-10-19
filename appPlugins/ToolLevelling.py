@@ -184,6 +184,9 @@ class ToolLevelling(CNCjob, AppTool):
         self.grbl_homed = False
         # the settings of the controller, as read with $$ when it was connected
         self.grbl_settings = {}
+        # the hard limits are switched off while the machine is jogged off a limit switch, because releasing the
+        # switch raises the alarm again otherwise
+        self.grbl_limits_suspended = False
         # a status report that was read before all of it arrived
         self.grbl_poll_partial = b''
 
@@ -1615,6 +1618,8 @@ class ToolLevelling(CNCjob, AppTool):
 
             port_name = self.grbl_ser_port.port
             try:
+                # the hard limits are not left off on a machine that is not watched anymore
+                self.grbl_restore_hard_limits()
                 self.grbl_ser_port.close()
             except Exception as e:
                 self.app.log.error("ToolLevelling.on_grbl_connect() --> %s" % str(e))
@@ -1655,11 +1660,20 @@ class ToolLevelling(CNCjob, AppTool):
                 if 'ok' in line.lower() or 'grbl' in line.lower():
                     # toggling DTR restarted the controller, whatever homing was done before is lost
                     self.grbl_homed = False
+                    self.grbl_limits_suspended = False
                     self.grbl_poll_partial = b''
                     self.grbl_read_settings()
                     self.grbl_set_connected_ui(True)
                     self.grbl_refresh_controls()
-                    self.app.inform.emit("%s: %s" % (_("Port connected"), port_name))
+                    state = self.grbl_read_status()
+                    if state is not None and state.startswith('alarm'):
+                        # with homing enabled GRBL starts up locked, the machine has not moved
+                        self.app.inform.emit('[WARNING_NOTCL] %s: %s. %s' % (
+                            _("Port connected"), port_name,
+                            _("GRBL starts locked until the machine is homed: press Do Home, or Unlock "
+                              "to work without homing.")))
+                    else:
+                        self.app.inform.emit("%s: %s" % (_("Port connected"), port_name))
                     return
 
             self.grbl_ser_port.close()
@@ -1835,6 +1849,11 @@ class ToolLevelling(CNCjob, AppTool):
 
         self.grbl_update_position_ui()
 
+        state = (self.grbl_status['state'] or '').lower()
+        if reading and self.grbl_limits_suspended and state == 'idle' and \
+                not any(axis in self.grbl_status['pins'] for axis in 'XYZ'):
+            self.grbl_run_in_background(self.grbl_restore_hard_limits)
+
     @staticmethod
     def grbl_origin_target(travelz, wco, ceilings):
         """
@@ -1877,6 +1896,8 @@ class ToolLevelling(CNCjob, AppTool):
                         text += '  (%s: %s)' % (_("limit switch pressed"), limits)
                     if 'P' in status['pins']:
                         text += '  (%s)' % _("probe touching")
+                if self.grbl_limits_suspended:
+                    text += '  (%s)' % _("hard limits off")
                 self.ui.grbl_state_label.set_value(text)
                 color = 'red' if state.lower().startswith('alarm') else \
                     'darkorange' if state.lower().startswith(('hold', 'door')) else 'seagreen'
@@ -2352,6 +2373,38 @@ class ToolLevelling(CNCjob, AppTool):
             return False
         return True
 
+    def grbl_suspend_hard_limits(self):
+        """
+        Switch the hard limits off. A limit switch raises the alarm when it changes, released or pressed, therefore
+        the machine cannot be jogged off a pressed switch while they are on.
+
+        :return:    True when they were switched off
+        :rtype:     bool
+        """
+        if not self.send_grbl_command(command='$21=0', echo=False, timeout=5.0):
+            return False
+        self.grbl_settings[21] = '0'
+        self.grbl_limits_suspended = True
+        return True
+
+    def grbl_restore_hard_limits(self):
+        """
+        Switch the hard limits on again once no limit switch is pressed anymore.
+
+        :return:    True when they are on
+        :rtype:     bool
+        """
+        if not self.grbl_limits_suspended:
+            return True
+        if not self.send_grbl_command(command='$21=1', echo=False, timeout=5.0):
+            self.app.inform.emit('[ERROR_NOTCL] %s' % _("The hard limits could not be switched on again, "
+                                                        "send $21=1."))
+            return False
+        self.grbl_settings[21] = '1'
+        self.grbl_limits_suspended = False
+        self.app.inform.emit('[success] %s' % _("The limit switch is released, the hard limits are on again."))
+        return True
+
     def on_grbl_unlock(self):
         if not self.grbl_is_connected():
             self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller is not connected."))
@@ -2392,7 +2445,11 @@ class ToolLevelling(CNCjob, AppTool):
 
         self.grbl_read_status()
         limits = ''.join(axis for axis in 'XYZ' if axis in self.grbl_status['pins'])
-        if limits:
+        if limits and int(self.grbl_setting(21, 0)) & 1 and self.grbl_suspend_hard_limits():
+            self.app.inform.emit('[WARNING_NOTCL] %s: %s. %s' % (
+                _("Unlocked, a limit switch is pressed"), limits,
+                _("Hard limits are off until it is released, jog away from it.")))
+        elif limits:
             self.app.inform.emit('[WARNING_NOTCL] %s: %s. %s' % (
                 _("Unlocked, but a limit switch is still pressed"), limits,
                 _("Jog away from it in small steps; if the alarm comes back, press Do Home.")))
@@ -2925,6 +2982,18 @@ class ToolLevelling(CNCjob, AppTool):
         if self.grbl_job_running or self.grbl_busy:
             return
 
+        # a controller in an alarm refuses the first line of the job; after a power up that is the homing lock
+        if self.grbl_check_manual() is None:
+            return
+        if self.grbl_limits_suspended:
+            if any(axis in self.grbl_status['pins'] for axis in 'XYZ'):
+                self.app.inform.emit('[ERROR_NOTCL] %s' % _("A limit switch is pressed, jog away from it first."))
+                return
+            if not self.grbl_restore_hard_limits():
+                return
+        if not self.grbl_job_fits(job_gcode):
+            return
+
         # show the Shell Dock
         self.app.ui.shell_dock.show()
 
@@ -2938,6 +3007,47 @@ class ToolLevelling(CNCjob, AppTool):
                 self.grbl_stream_gcode(job_gcode, start_line=start_line)
 
         self.app.worker_task.emit({'fcn': worker_task, 'params': []})
+
+    @staticmethod
+    def grbl_job_top_z(job_gcode):
+        """
+        The highest Z a job moves to, in work coordinates.
+
+        :param job_gcode:   the GCode of the job
+        :type job_gcode:    str
+        :return:            the Z, or None when the job has no Z or uses relative moves, inch or offsets, which
+                            make it not known without running it
+        :rtype:             float or None
+        """
+        heights = []
+        for line in job_gcode.splitlines():
+            code = re.sub(r"\(.*?\)|;.*", '', line).upper()
+            if re.search(r"G0*91(?![.\d])|G0*20(?!\d)|G0*92|G0*5[35-9](?!\d)|G0*10(?!\d)", code):
+                return None
+            heights += [float(value) for axis, value in ToolLevelling.coord_re.findall(code) if axis == 'Z']
+        return max(heights) if heights else None
+
+    def grbl_job_fits(self, job_gcode):
+        """
+        Find out that the job does not go above the top of the machine, where the limit switch is: hitting it
+        ends the job with an alarm.
+
+        :param job_gcode:   the GCode of the job
+        :type job_gcode:    str
+        :return:            False when the job would run into the switch
+        :rtype:             bool
+        """
+        ceiling = self.grbl_ceilings()[2]
+        wco = self.grbl_status['wco']
+        top_z = self.grbl_job_top_z(job_gcode)
+        if self.units != 'MM' or ceiling is None or wco is None or top_z is None:
+            return True
+        if top_z + wco[2] <= ceiling + 0.001:
+            return True
+        self.app.inform.emit('[ERROR_NOTCL] %s' % (
+            _("The job moves up to Z %.3f, which is %.3f mm above the top of the machine. Set the work Z zero "
+              "lower, or make the travel and end Z of the job smaller.") % (top_z, top_z + wco[2] - ceiling)))
+        return False
 
     def on_grbl_resume_job(self):
         """
@@ -3323,13 +3433,17 @@ class ToolLevelling(CNCjob, AppTool):
 
             decoded = self.grbl_decode(raw)
             self.grbl_note_lines(decoded)
+            state = None
             for response in decoded:
                 stripped = response.strip()
                 if stripped.startswith('<'):
-                    return stripped[1:].split('|')[0].strip().lower()
-                if stripped and stripped.lower() != 'ok':
+                    # the last one counts: the ones before answer what the position display asked for earlier
+                    state = stripped[1:].split('|')[0].strip().lower()
+                elif stripped and stripped.lower() != 'ok':
                     # what the controller says on its own, a limit alarm for instance
                     self.app.inform_shell.emit('\t\t\t: ' + stripped.upper())
+            if state is not None:
+                return state
 
         return None
 
