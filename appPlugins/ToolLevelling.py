@@ -176,6 +176,21 @@ class ToolLevelling(CNCjob, AppTool):
         self.grbl_busy = 0
         # counts the soft resets; an answer that is waited for will never come once the controller was reset
         self.grbl_resets = 0
+        # what the last status report of the controller said: its state, the machine and the work position, the
+        # offset of the work origin from the machine origin and the input pins that are active
+        self.grbl_status = {'state': None, 'mpos': None, 'wpos': None, 'wco': None, 'pins': ''}
+        self.grbl_status_line = ''
+        # whether the machine was homed since it was connected; only then the top of its travel is known
+        self.grbl_homed = False
+        # the settings of the controller, as read with $$ when it was connected
+        self.grbl_settings = {}
+        # a status report that was read before all of it arrived
+        self.grbl_poll_partial = b''
+
+        # asks the controller for its status, for the position display
+        self.grbl_status_timer = QtCore.QTimer()
+        self.grbl_status_timer.setInterval(250)
+        self.grbl_status_timer.timeout.connect(self.on_grbl_status_tick)
 
         # connected once here and not with the other signals, which are connected again every time the UI is
         # built: a second connection would end the busy state of two commands at once
@@ -292,9 +307,10 @@ class ToolLevelling(CNCjob, AppTool):
         self.ui.zero_axs_wdg.grbl_zero_all_button.clicked.connect(lambda: self.on_grbl_zero(axis='all'))
         self.ui.zero_axs_wdg.grbl_homing_button.clicked.connect(self.on_grbl_homing)
         self.ui.probe_z_button.clicked.connect(self.on_grbl_probe_z)
+        self.ui.grbl_unlock_button.clicked.connect(self.on_grbl_unlock)
 
         # Sender
-        self.ui.grbl_report_button.clicked.connect(lambda: self.send_grbl_command(command='?'))
+        self.ui.grbl_report_button.clicked.connect(self.on_grbl_report)
         self.ui.grbl_get_param_button.clicked.connect(
             lambda: self.on_grbl_get_parameter(param=self.ui.grbl_parameter_entry.get_value()))
         self.ui.view_h_gcode_button.clicked.connect(self.on_edit_probing_gcode)
@@ -1583,6 +1599,13 @@ class ToolLevelling(CNCjob, AppTool):
             if self.ui.al_toolbar.tabText(idx) in (_("Control"), _("Sender")):
                 self.ui.al_toolbar.tabBar.setTabEnabled(idx, connected)
 
+        if connected:
+            self.grbl_status_timer.start()
+        else:
+            self.grbl_status_timer.stop()
+            self.grbl_status = {'state': None, 'mpos': None, 'wpos': None, 'wco': None, 'pins': ''}
+        self.grbl_update_position_ui()
+
     def on_grbl_connect(self):
         if self.grbl_is_connected():
             # the button toggles: a connected controller is disconnected
@@ -1630,6 +1653,10 @@ class ToolLevelling(CNCjob, AppTool):
             answer = self.on_grbl_wake()
             for line in answer:
                 if 'ok' in line.lower() or 'grbl' in line.lower():
+                    # toggling DTR restarted the controller, whatever homing was done before is lost
+                    self.grbl_homed = False
+                    self.grbl_poll_partial = b''
+                    self.grbl_read_settings()
                     self.grbl_set_connected_ui(True)
                     self.grbl_refresh_controls()
                     self.app.inform.emit("%s: %s" % (_("Port connected"), port_name))
@@ -1687,15 +1714,210 @@ class ToolLevelling(CNCjob, AppTool):
                 decoded.append(str(line).strip())
         return decoded
 
-    def grbl_read_reply(self, timeout=30.0):
+    def grbl_note_lines(self, lines):
+        """
+        Keep what the controller tells about itself: its status reports and the alarms that lose the position.
+
+        :param lines:   decoded lines read from the controller
+        :type lines:    list
+        """
+        for line in lines:
+            if line.startswith('<'):
+                self.grbl_note_status(line)
+            elif line.upper() in ('ALARM:1', 'ALARM:2', 'ALARM:3'):
+                # a limit was hit or the controller was reset while moving, the position is not trusted anymore
+                self.grbl_homed = False
+
+    def grbl_note_status(self, line):
+        """
+        Parse a status report like <Idle|MPos:0.000,0.000,0.000|FS:0,0|WCO:0.000,0.000,0.000|Pn:Z>
+
+        :param line:    the status report
+        :type line:     str
+        """
+        self.grbl_status_line = line.strip()
+        fields = line.strip().strip('<>').split('|')
+        status = self.grbl_status
+        status['state'] = fields[0]
+        status['pins'] = ''
+
+        reported = None
+        for field in fields[1:]:
+            key, __, value = field.partition(':')
+            if key in ('MPos', 'WPos', 'WCO'):
+                try:
+                    numbers = [float(v) for v in value.split(',')[:3]]
+                except ValueError:
+                    continue
+                if len(numbers) != 3:
+                    continue
+                status[key.lower()] = numbers
+                if key != 'WCO':
+                    reported = key
+            elif key == 'Pn':
+                status['pins'] = value
+
+        # the controller reports either the machine or the work position ($10), the other one comes from the
+        # offset of the work origin that it reports every now and then
+        wco = status['wco']
+        if reported == 'MPos':
+            status['wpos'] = [m - o for m, o in zip(status['mpos'], wco)] if wco else None
+        elif reported == 'WPos':
+            status['mpos'] = [w + o for w, o in zip(status['wpos'], wco)] if wco else None
+
+    def grbl_read_settings(self):
+        """
+        Read the settings of the controller ($$), they tell how the machine homes and how far it can travel.
+        """
+        self.grbl_settings = {}
+        try:
+            answer = self.send_grbl_command('$$', echo=False, timeout=5.0)
+        except Exception as e:
+            self.app.log.error("ToolLevelling.grbl_read_settings() --> %s" % str(e))
+            return
+        for line in answer.splitlines():
+            key, __, value = line.partition('=')
+            if key.startswith('$') and key[1:].isdigit():
+                self.grbl_settings[int(key[1:])] = value.partition(' ')[0]
+
+    def grbl_setting(self, number, default):
+        try:
+            return float(self.grbl_settings.get(number, default))
+        except ValueError:
+            return float(default)
+
+    def grbl_ceilings(self):
+        """
+        For X, Y and Z the highest machine position the machine can be sent to without running into the limit
+        switch it homes against. It is known only once the machine was homed, for an axis that homes in the
+        positive direction, Z up for instance: GRBL leaves it at -$27 then, the pull-off away from the switch.
+
+        :return:    the machine positions in mm, None for an axis where it is not known
+        :rtype:     list
+        """
+        if not self.grbl_homed or int(self.grbl_setting(22, 0)) & 1 == 0:
+            return [None, None, None]
+        pulloff = self.grbl_setting(27, 1.0)
+        # a bit of $23 that is set makes the axis home in the negative direction
+        direction_mask = int(self.grbl_setting(23, 0))
+        return [None if direction_mask & (1 << axis) else -pulloff for axis in range(3)]
+
+    def on_grbl_status_tick(self):
+        """
+        Ask the controller for a status report for the position display. While a job streams or a task runs in the
+        background they read the answers, otherwise the reports are read here without waiting for them.
+        """
+        if not self.grbl_is_connected():
+            self.grbl_status_timer.stop()
+            return
+
+        reading = not self.grbl_busy and not (self.grbl_job_running and not self.grbl_job_waiting)
+        try:
+            self.grbl_ser_port.write(b'?')
+            if reading:
+                waiting = self.grbl_ser_port.in_waiting
+                if waiting:
+                    raw = self.grbl_poll_partial + self.grbl_ser_port.read(waiting)
+                    lines = raw.split(b'\n')
+                    self.grbl_poll_partial = lines.pop()
+                    decoded = self.grbl_decode(lines)
+                    self.grbl_note_lines(decoded)
+                    for line in decoded:
+                        # what the controller says on its own, a limit alarm for instance, would be lost otherwise
+                        if line and not line.startswith('<') and line.lower() != 'ok':
+                            self.app.inform_shell.emit('\t\t\t: ' + line.upper())
+            else:
+                self.grbl_poll_partial = b''
+        except Exception as e:
+            self.app.log.error("ToolLevelling.on_grbl_status_tick() --> %s" % str(e))
+            self.grbl_status_timer.stop()
+            return
+
+        self.grbl_update_position_ui()
+
+    @staticmethod
+    def grbl_origin_target(travelz, wco, ceilings):
+        """
+        Where Go to origin sends the tool, in machine coordinates: over the work origin at the travel height,
+        but not past the limit switches.
+
+        :param travelz:     the travel height, in work coordinates
+        :type travelz:      float
+        :param wco:         the machine position of the work origin
+        :type wco:          list
+        :param ceilings:    as they come out of grbl_ceilings()
+        :type ceilings:     list
+        :return:            the machine X, Y and Z, and for each of them whether it was limited
+        :rtype:             tuple
+        """
+        wanted = [wco[0], wco[1], wco[2] + float(travelz)]
+        target = [value if ceiling is None else min(value, ceiling) for value, ceiling in zip(wanted, ceilings)]
+        return target, [t < w - 1e-9 for t, w in zip(target, wanted)]
+
+    def grbl_update_position_ui(self):
+        """
+        Show the state and the position of the machine, where its work origin is and where Go to origin moves to.
+        """
+        status = self.grbl_status
+        state = status['state']
+
+        def show(labels, numbers):
+            for label, number in zip(labels, numbers if numbers else [None] * 3):
+                label.set_value('-' if number is None else '%.3f' % number)
+
+        try:
+            if state is None:
+                self.ui.grbl_state_label.set_value('-')
+                self.ui.grbl_state_label.setStyleSheet("")
+            else:
+                text = state
+                if status['pins']:
+                    limits = ''.join(axis for axis in 'XYZ' if axis in status['pins'])
+                    if limits:
+                        text += '  (%s: %s)' % (_("limit switch pressed"), limits)
+                    if 'P' in status['pins']:
+                        text += '  (%s)' % _("probe touching")
+                self.ui.grbl_state_label.set_value(text)
+                color = 'red' if state.lower().startswith('alarm') else \
+                    'darkorange' if state.lower().startswith(('hold', 'door')) else 'seagreen'
+                self.ui.grbl_state_label.setStyleSheet("QLabel {color: %s; font-weight: bold;}" % color)
+
+            show(self.ui.grbl_wpos_labels, status['wpos'])
+            show(self.ui.grbl_mpos_labels, status['mpos'])
+            show(self.ui.grbl_wco_labels, status['wco'])
+
+            wco = status['wco']
+            if state is None or wco is None:
+                self.ui.grbl_origin_label.set_value('')
+                return
+            travelz = float(self.app.options["tools_al_grbl_travelz"])
+            ceilings = self.grbl_ceilings() if self.units == 'MM' else [None, None, None]
+            target, limited = self.grbl_origin_target(travelz, wco, ceilings)
+            text = '%s: %s X%.3f Y%.3f Z%.3f  (%s X%.3f Y%.3f Z%.3f)' % (
+                _("Go to origin"), _("machine"), *target,
+                _("work"), *[t - o for t, o in zip(target, wco)])
+            if any(limited):
+                text += '\n%s: %s' % (_("Stops short of the limit switch on"),
+                                      ''.join(axis for axis, flag in zip('XYZ', limited) if flag))
+            elif not self.grbl_homed:
+                text += '\n%s' % _("Not homed: where the limit switches are is not known, check the move is safe.")
+            self.ui.grbl_origin_label.set_value(text)
+        except (RuntimeError, AttributeError):
+            # the panel was not built or was already deleted
+            pass
+
+    def grbl_read_reply(self, timeout=30.0, keep_status=False):
         """
         Read the answer of the GRBL controller until it acknowledges the command with 'ok' or reports a problem.
         The serial port has a short read timeout therefore reading is repeated until the deadline.
 
-        :param timeout: for how long to wait for an acknowledgement, in seconds
-        :type timeout:  float
-        :return:        the answer lines of the controller and whether it acknowledged the command
-        :rtype:         tuple
+        :param timeout:     for how long to wait for an acknowledgement, in seconds
+        :type timeout:      float
+        :param keep_status: if the status reports are part of the answer; the position display asks for them all
+                            the time therefore they are left out unless the command asked for one
+        :type keep_status:  bool
+        :return:            the answer lines of the controller and whether it acknowledged the command
+        :rtype:             tuple
         """
         deadline = time.monotonic() + timeout
         answer = []
@@ -1715,7 +1937,8 @@ class ToolLevelling(CNCjob, AppTool):
                 if not raw[-1].endswith(b'\n'):
                     partial = raw.pop()
             new_lines = self.grbl_decode(raw)
-            answer += [line for line in new_lines if line != '']
+            self.grbl_note_lines(new_lines)
+            answer += [line for line in new_lines if line != '' and (keep_status or not line.startswith('<'))]
 
             for line in answer:
                 low_line = line.lower()
@@ -1758,7 +1981,9 @@ class ToolLevelling(CNCjob, AppTool):
         # Send Gcode command to GRBL
         snd = cmd + '\n'
         self.grbl_ser_port.write(snd.encode('utf-8'))
-        answer, acknowledged = self.grbl_read_reply(timeout=timeout)
+        answer, acknowledged = self.grbl_read_reply(timeout=timeout, keep_status=cmd == '?')
+        if acknowledged and cmd.upper() == '$H':
+            self.grbl_homed = True
 
         if not answer:
             self.app.inform_shell[str, bool].emit('\t\t\t: No answer\n', False)
@@ -1788,6 +2013,18 @@ class ToolLevelling(CNCjob, AppTool):
                 for line in answer:
                     self.app.inform_shell.emit(' : ' + line.upper())
 
+    def on_grbl_report(self):
+        if not self.grbl_is_connected():
+            return
+
+        # a status report is not acknowledged with 'ok', therefore it is not sent like a command
+        self.app.ui.shell_dock.show()
+        self.app.inform_shell[str, bool].emit('?', False)
+        if self.grbl_read_status() is None:
+            self.app.inform_shell[str, bool].emit('\t\t\t: No answer\n', False)
+        else:
+            self.app.inform_shell.emit('\t\t\t: ' + self.grbl_status_line)
+
     def on_grbl_get_parameter(self, param):
         param = str(param).replace('$', '').strip()
 
@@ -1810,9 +2047,12 @@ class ToolLevelling(CNCjob, AppTool):
         return None
 
     @staticmethod
-    def grbl_jog_commands(direction, units, step, feedrate, travelz):
+    def grbl_jog_commands(direction, units, step, feedrate, travelz, ceilings=None, wco=None, mpos=None):
         """
         The jog commands that move the machine one step in a direction, or back to the work origin.
+
+        A move that would go past the limit switch the machine homes against stops short of it instead: hitting
+        the switch puts the controller in an alarm that only a reset clears.
 
         :param direction:   'xplus', 'xminus', 'yplus', 'yminus', 'zplus', 'zminus' or 'origin'
         :type direction:    str
@@ -1824,17 +2064,39 @@ class ToolLevelling(CNCjob, AppTool):
         :type feedrate:     str
         :param travelz:     the height to lift to before going to the origin, in work coordinates
         :type travelz:      str
-        :return:            the commands, in the order they are to be sent; none for an unknown direction
+        :param ceilings:    as they come out of grbl_ceilings(), or None when they are not known
+        :type ceilings:     list
+        :param wco:         the machine position of the work origin, in mm
+        :type wco:          list
+        :param mpos:        the machine position, in mm
+        :type mpos:         list
+        :return:            the commands, in the order they are to be sent; none for an unknown direction or for a
+                            step towards a limit switch the machine is at already
         :rtype:             list
         """
         unit_code = {'IN': 'G20', 'MM': 'G21'}[units]
+        # the positions the controller reports are in mm
+        if units != 'MM' or ceilings is None:
+            ceilings = [None, None, None]
 
         if direction == 'origin':
+            lift = '$J=G90 %s Z%s F%s' % (unit_code, travelz, feedrate)
+            over = '$J=G90 %s X0.0 Y0.0 F%s' % (unit_code, feedrate)
+            if wco is not None:
+                target, limited = ToolLevelling.grbl_origin_target(travelz, wco, ceilings)
+                if limited[2]:
+                    lift = '$J=G53 G21 Z%.3f F%s' % (target[2], feedrate)
+                if limited[0] or limited[1]:
+                    over = '$J=G53 G21 X%.3f Y%.3f F%s' % (target[0], target[1], feedrate)
             # lifted first, so that the tool is not dragged over the work on the way
-            return [
-                '$J=G90 %s Z%s F%s' % (unit_code, travelz, feedrate),
-                '$J=G90 %s X0.0 Y0.0 F%s' % (unit_code, feedrate)
-            ]
+            return [lift, over]
+
+        axis = {'xplus': 0, 'yplus': 1, 'zplus': 2}.get(direction)
+        if axis is not None and ceilings[axis] is not None and mpos is not None and \
+                mpos[axis] + float(step) > ceilings[axis]:
+            if mpos[axis] >= ceilings[axis] - 0.001:
+                return []
+            return ['$J=G53 G21 %s%.3f F%s' % ('XYZ'[axis], ceilings[axis], feedrate)]
 
         move = {
             'xplus': 'X%s', 'xminus': 'X-%s',
@@ -1846,35 +2108,82 @@ class ToolLevelling(CNCjob, AppTool):
         return ['$J=G91 %s %s F%s' % (unit_code, move % step, feedrate)]
 
     def on_grbl_jog(self, direction=None):
+        if self.grbl_check_manual() is None:
+            return
+
         commands = self.grbl_jog_commands(
             direction=direction,
             units=self.units,
             step=str(self.ui.jog_step_entry.get_value()),
             feedrate=str(self.ui.jog_fr_entry.get_value()),
-            travelz=str(float(self.app.options["tools_al_grbl_travelz"]))
+            travelz=str(float(self.app.options["tools_al_grbl_travelz"])),
+            ceilings=self.grbl_ceilings(),
+            wco=self.grbl_status['wco'],
+            mpos=self.grbl_status['mpos']
         )
+        if not commands and direction in ('xplus', 'yplus', 'zplus'):
+            self.app.inform.emit('[WARNING_NOTCL] %s' % _("The axis is at its limit switch already."))
+            return
 
         for command in commands:
-            if self.grbl_send_manual(command) is False:
+            if self.grbl_send_manual(command, check_state=False) is False:
                 return
 
-    def grbl_send_manual(self, command):
+    def grbl_check_manual(self):
+        """
+        Find out if the controller takes commands. In an alarm or a hold it refuses them, and after a limit was
+        hit it does not even answer them, therefore nothing is sent then and the operator is told what to do.
+
+        :return:    the state of the controller, or None when it cannot take commands
+        :rtype:     str
+        """
+        if not self.grbl_is_connected():
+            self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller is not connected."))
+            return None
+
+        state = self.grbl_read_status()
+        if state is None:
+            self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller does not answer. "
+                                                        "Press Reset on the Connect tab."))
+            return None
+        if state.startswith('alarm'):
+            limits = ''.join(axis for axis in 'XYZ' if axis in self.grbl_status['pins'])
+            if limits:
+                self.app.inform.emit('[ERROR_NOTCL] %s: %s. %s' % (
+                    _("The GRBL controller is in an alarm state and a limit switch is pressed"), limits,
+                    _("Press Do Home, or Unlock and jog away from the switch.")))
+            else:
+                self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller is in an alarm state. "
+                                                            "Press Do Home, or Unlock."))
+            return None
+        if state.startswith(('hold', 'door')):
+            self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller holds the motion. "
+                                                        "Press Pause/Resume to go on, or Reset."))
+            return None
+        return state
+
+    def grbl_send_manual(self, command, check_state=True):
         """
         Send a command that the operator gave by pressing a button and say so when the controller refused it.
         A jog that is out of the machine travel, or anything sent while the controller is in an alarm, is
         answered with an error and the machine does not move, which without this looks like a button that does
         nothing.
 
-        :param command: the command
-        :type command:  str
-        :return:        True when the controller accepted the command
-        :rtype:         bool
+        :param command:     the command
+        :type command:      str
+        :param check_state: if to find out first that the controller takes commands
+        :type check_state:  bool
+        :return:            True when the controller accepted the command
+        :rtype:             bool
         """
         if not self.grbl_is_connected():
             self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller is not connected."))
             return False
 
-        if self.send_grbl_command(command=command, echo=False):
+        if check_state and self.grbl_check_manual() is None:
+            return False
+
+        if self.send_grbl_command(command=command, echo=False, timeout=10.0):
             return True
 
         # the state says why: an alarm has to be cleared with $X or a homing, a hold with the Pause/Resume
@@ -1941,8 +2250,7 @@ class ToolLevelling(CNCjob, AppTool):
         Probe down for the surface and make the touch point the Z origin, which sets the length of the tool
         that was just mounted.
         """
-        if not self.grbl_is_connected():
-            self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller is not connected."))
+        if self.grbl_check_manual() is None:
             return
 
         # show the Shell Dock
@@ -2004,9 +2312,16 @@ class ToolLevelling(CNCjob, AppTool):
         :return:    True when the machine is homed
         :rtype:     bool
         """
-        resets = self.grbl_resets
         self.grbl_ser_port.reset_input_buffer()
+        state = self.grbl_read_status()
+        if state is None:
+            self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller does not answer. "
+                                                        "Press Reset on the Connect tab."))
+            return False
+        if state.startswith('alarm') and not self.grbl_soft_reset():
+            return False
 
+        resets = self.grbl_resets
         if self.send_grbl_command(command='$H', timeout=180.0):
             self.app.inform.emit('[success] %s' % _("The machine is homed."))
             return True
@@ -2016,6 +2331,77 @@ class ToolLevelling(CNCjob, AppTool):
                 '[ERROR_NOTCL] %s' % _("The homing cycle failed. The answer of the controller is in the shell; "
                                        "error:5 means that homing is disabled with $22=0."))
         return False
+
+    def grbl_soft_reset(self):
+        """
+        Reset the controller and wait for it to restart. After a limit was hit GRBL takes nothing but a reset;
+        the work offsets set with G10 are kept, the position is lost.
+
+        :return:    True when the controller answers again
+        :rtype:     bool
+        """
+        self.grbl_resets += 1
+        self.grbl_homed = False
+        self.grbl_ser_port.write(b'\x18')
+        # the controller prints its welcome message once it restarted
+        time.sleep(1.5)
+        self.grbl_ser_port.reset_input_buffer()
+
+        if self.grbl_read_status() is None:
+            self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller did not answer after the reset."))
+            return False
+        return True
+
+    def on_grbl_unlock(self):
+        if not self.grbl_is_connected():
+            self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller is not connected."))
+            return
+
+        self.app.ui.shell_dock.show()
+        self.grbl_run_in_background(self.grbl_unlock)
+
+    def grbl_unlock(self):
+        """
+        Clear an alarm with $X. After a limit was hit the controller does not answer $X before it was reset,
+        therefore it is reset then and $X is sent again.
+
+        :return:    True when the controller is unlocked
+        :rtype:     bool
+        """
+        self.grbl_ser_port.reset_input_buffer()
+        state = self.grbl_read_status()
+        if state is None:
+            self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller does not answer. "
+                                                        "Press Reset on the Connect tab."))
+            return False
+        if not state.startswith('alarm'):
+            self.app.inform.emit('%s: %s' % (_("The GRBL controller is not locked, its state is"), state))
+            return True
+
+        # an $X that can be taken is answered at once
+        unlocked = bool(self.send_grbl_command(command='$X', timeout=1.0))
+        if not unlocked:
+            # a critical alarm, a limit was hit
+            if not self.grbl_soft_reset():
+                return False
+            unlocked = bool(self.send_grbl_command(command='$X', timeout=3.0))
+        if not unlocked:
+            self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller could not be unlocked. "
+                                                        "Press Do Home."))
+            return False
+
+        self.grbl_read_status()
+        limits = ''.join(axis for axis in 'XYZ' if axis in self.grbl_status['pins'])
+        if limits:
+            self.app.inform.emit('[WARNING_NOTCL] %s: %s. %s' % (
+                _("Unlocked, but a limit switch is still pressed"), limits,
+                _("Jog away from it in small steps; if the alarm comes back, press Do Home.")))
+        elif self.grbl_homed:
+            self.app.inform.emit('[success] %s' % _("The GRBL controller is unlocked."))
+        else:
+            self.app.inform.emit('[WARNING_NOTCL] %s' % _("The GRBL controller is unlocked, but the machine "
+                                                          "position is not known. Home it before a job."))
+        return True
 
     def on_grbl_reset(self):
         """
@@ -2614,6 +3000,7 @@ class ToolLevelling(CNCjob, AppTool):
         self.ui.jog_wdg.setDisabled(not enabled)
         self.ui.zero_axs_wdg.setDisabled(not enabled)
         self.ui.probe_z_button.setDisabled(not enabled)
+        self.ui.grbl_unlock_button.setDisabled(not enabled)
         self.ui.grbl_command_entry.setDisabled(not enabled)
         self.ui.grbl_send_button.setDisabled(not enabled)
         self.ui.grbl_report_button.setDisabled(not enabled)
@@ -2850,7 +3237,9 @@ class ToolLevelling(CNCjob, AppTool):
                 self.grbl_rx_partial = b''
                 if not raw[-1].endswith(b'\n'):
                     self.grbl_rx_partial = raw.pop()
-                pending.extend(self.grbl_decode(raw))
+                decoded = self.grbl_decode(raw)
+                self.grbl_note_lines(decoded)
+                pending.extend(decoded)
 
             if not pending:
                 time.sleep(0.01)
@@ -2900,8 +3289,10 @@ class ToolLevelling(CNCjob, AppTool):
                 )
                 return False
 
-            # the controller has something to say that is not about the line that was sent
-            self.app.inform_shell.emit('\t\t\t: %s' % response.upper())
+            # the controller has something to say that is not about the line that was sent; the status reports
+            # that the position display asks for are kept but not shown
+            if not response.startswith('<'):
+                self.app.inform_shell.emit('\t\t\t: %s' % response.upper())
 
     def grbl_read_status(self, timeout=2.0):
         """
@@ -2930,10 +3321,15 @@ class ToolLevelling(CNCjob, AppTool):
                 if not raw[-1].endswith(b'\n'):
                     partial = raw.pop()
 
-            for response in self.grbl_decode(raw):
+            decoded = self.grbl_decode(raw)
+            self.grbl_note_lines(decoded)
+            for response in decoded:
                 stripped = response.strip()
                 if stripped.startswith('<'):
                     return stripped[1:].split('|')[0].strip().lower()
+                if stripped and stripped.lower() != 'ok':
+                    # what the controller says on its own, a limit alarm for instance
+                    self.app.inform_shell.emit('\t\t\t: ' + stripped.upper())
 
         return None
 
@@ -3625,6 +4021,54 @@ class LevelUI:
         # #############################################################################################################
         # GRBL CONTROL
         # #############################################################################################################
+        self.pos_grbl_frame = FCFrame()
+        self.gr_ctrl_tab_layout.addWidget(self.pos_grbl_frame)
+        grbl_pos_grid = GLay(v_spacing=3, h_spacing=6, c_stretch=[0, 1, 1, 1])
+        self.pos_grbl_frame.setLayout(grbl_pos_grid)
+
+        state_title_label = FCLabel('%s:' % _("State"), bold=True)
+        self.grbl_state_label = FCLabel('-')
+        self.grbl_unlock_button = FCButton(_("Unlock"))
+        self.grbl_unlock_button.setToolTip(
+            _("Clear an alarm of the controller ($X).\n"
+              "After a limit switch was hit the controller is reset first.\n"
+              "Do Home also clears an alarm and makes the position known again.")
+        )
+        state_h_lay = QtWidgets.QHBoxLayout()
+        state_h_lay.addWidget(self.grbl_state_label, stretch=1)
+        state_h_lay.addWidget(self.grbl_unlock_button)
+        grbl_pos_grid.addWidget(state_title_label, 0, 0)
+        grbl_pos_grid.addLayout(state_h_lay, 0, 1, 1, 3)
+
+        for col, axis in enumerate(('X', 'Y', 'Z'), start=1):
+            grbl_pos_grid.addWidget(FCLabel(axis, bold=True), 1, col)
+
+        position_rows = (
+            (_("Work"), _("The position in work coordinates, relative to the work origin set with Zero Axes.")),
+            (_("Machine"), _("The position in machine coordinates, relative to where the machine homes.")),
+            (_("Origin"), _("Where the work origin is, in machine coordinates.")),
+        )
+        position_labels = []
+        for row, (title, tip) in enumerate(position_rows, start=2):
+            title_label = FCLabel('%s:' % title)
+            title_label.setToolTip(tip)
+            grbl_pos_grid.addWidget(title_label, row, 0)
+            labels = []
+            for col in range(1, 4):
+                value_label = FCLabel('-')
+                value_label.setToolTip(tip)
+                grbl_pos_grid.addWidget(value_label, row, col)
+                labels.append(value_label)
+            position_labels.append(labels)
+        self.grbl_wpos_labels, self.grbl_mpos_labels, self.grbl_wco_labels = position_labels
+
+        self.grbl_origin_label = FCLabel('')
+        self.grbl_origin_label.setWordWrap(True)
+        self.grbl_origin_label.setToolTip(
+            _("Where Go to origin moves: up to the travel height first, then over the work origin.")
+        )
+        grbl_pos_grid.addWidget(self.grbl_origin_label, 5, 0, 1, 4)
+
         self.ctrl_grbl_frame = FCFrame()
         self.gr_ctrl_tab_layout.addWidget(self.ctrl_grbl_frame)
         grbl_ctrl_grid = GLay(v_spacing=5, h_spacing=3, c_stretch=[0, 1, 0])

@@ -49,8 +49,13 @@ class FakeGrbl:
         self.chunk = chunk
         # when set, nothing is answered, like a controller that is busy with a long homing
         self.mute = False
+        # when set, a move past machine 0 runs into the limit switch the machine homes against
+        self.hard_limits = False
+        # after a limit was hit the controller takes nothing but a reset and status queries
+        self.critical = False
 
-        self.settings = {0: '10', 1: '25', 10: '1', 11: '0.010', 20: '0', 22: '1', 100: '800.000', 110: '5000.000'}
+        self.settings = {0: '10', 1: '25', 10: '1', 11: '0.010', 20: '0', 21: '0', 22: '1', 23: '0', 27: '1.000',
+                         100: '800.000', 110: '5000.000'}
 
         self.lines = []
         self.realtime = []
@@ -67,7 +72,7 @@ class FakeGrbl:
                 elif ch == '\n':
                     line, self._rx = self._rx.strip(), ''
                     self.lines.append(line)
-                    if not self.mute:
+                    if not self.mute and not self.critical:
                         self._line(line)
                 elif ch != '\r':
                     self._rx += ch
@@ -86,6 +91,16 @@ class FakeGrbl:
         if parts[-1]:
             lines.append(parts[-1])
         return lines
+
+    @property
+    def in_waiting(self):
+        with self.lock:
+            return min(len(self._tx), self.chunk) if self.chunk else len(self._tx)
+
+    def read(self, size=1):
+        with self.lock:
+            data, self._tx = self._tx[:size], self._tx[size:]
+        return data
 
     def reset_input_buffer(self):
         with self.lock:
@@ -108,7 +123,20 @@ class FakeGrbl:
         self._tx += (text + '\r\n').encode('utf-8')
 
     def _status(self):
-        return '<%s|MPos:%.3f,%.3f,%.3f|FS:0,0|WCO:%.3f,%.3f,%.3f>' % (self.state, *self.mpos, *self.wco)
+        pins = ''.join(axis for axis, value in zip('XYZ', self.mpos) if value >= -0.001)
+        return '<%s|MPos:%.3f,%.3f,%.3f|FS:0,0|WCO:%.3f,%.3f,%.3f%s>' % (
+            self.state, *self.mpos, *self.wco, '|Pn:' + pins if self.hard_limits and pins else '')
+
+    def _move(self, target):
+        """Move to the target; past machine 0 the machine runs into a limit switch and stops there."""
+        if self.hard_limits and any(value > 0.0 for value in target):
+            self.mpos = [min(value, 0.0) for value in target]
+            self.state = 'Alarm'
+            self.critical = True
+            self._emit('ALARM:1')
+            self._emit('[MSG:Reset to continue]')
+            return
+        self.mpos = target
 
     def _realtime(self, ch):
         if ch == '?':
@@ -125,11 +153,14 @@ class FakeGrbl:
                 self.state = 'Alarm'
             elif not self.state.startswith('Alarm'):
                 self.state = 'Idle'
+            self.critical = False
             self.relative = False
             self._rx = ''
             self._tx = b''
             self._emit('')
             self._emit("Grbl 1.1h ['$' for help]")
+            if self.state == 'Alarm':
+                self._emit("[MSG:'$H'|'$X' to unlock]")
 
     @staticmethod
     def _words(text):
@@ -176,7 +207,8 @@ class FakeGrbl:
             if self.settings[22] == '0':
                 self._emit('error:5')
                 return
-            self.mpos = [0.0, 0.0, 0.0]
+            # every axis homes in the positive direction and is pulled off the switch by $27
+            self.mpos = [-float(self.settings[27])] * 3
             self.state = 'Idle'
             self._emit('ok')
         elif upper == '$X':
@@ -217,9 +249,9 @@ class FakeGrbl:
             self._emit('error:15')
             return
 
-        # a jog leaves the modal state of the parser alone
-        self.mpos = target
+        # a jog leaves the modal state of the parser alone; it is acknowledged before it moves
         self._emit('ok')
+        self._move(target)
 
     def _gcode(self, upper):
         words = self._words(upper)
@@ -268,10 +300,9 @@ class FakeGrbl:
         if 'M0' in codes or 'M1' in codes:
             self.state = 'Hold:0'
 
-        if any(letter in 'XYZ' for letter, _v in words):
-            self.mpos = self._target(words, relative=self.relative)
-
         self._emit('ok')
+        if any(letter in 'XYZ' for letter, _v in words):
+            self._move(self._target(words, relative=self.relative))
 
 
 class Recorder:
@@ -368,6 +399,15 @@ def make_sender(port):
     tool.grbl_can_resume = False
     tool.grbl_busy = 0
     tool.grbl_resets = 0
+    tool.grbl_status = {'state': None, 'mpos': None, 'wpos': None, 'wco': None, 'pins': ''}
+    tool.grbl_status_line = ''
+    tool.grbl_homed = False
+    tool.grbl_settings = {}
+    tool.grbl_poll_partial = b''
+    tool.grbl_status_timer = SimpleNamespace(start=lambda: None, stop=lambda: None)
+    tool.ui.grbl_wpos_labels = [FakeWidget() for _i in range(3)]
+    tool.ui.grbl_mpos_labels = [FakeWidget() for _i in range(3)]
+    tool.ui.grbl_wco_labels = [FakeWidget() for _i in range(3)]
 
     tool.grbl_job_progress_sig = Recorder()
     tool.grbl_job_paused_sig = Recorder()
@@ -406,6 +446,98 @@ class TestJogCommands(unittest.TestCase):
     def test_an_unknown_direction_sends_nothing(self):
         self.assertEqual(ToolLevelling.grbl_jog_commands(None, 'MM', '5.0', '1500.0', '15.0'), [])
 
+    def test_the_lift_stops_below_the_top_of_the_machine(self):
+        # no work origin was set, therefore the travel height is 15 mm above the top of the machine
+        commands = ToolLevelling.grbl_jog_commands('origin', 'MM', '5.0', '1500.0', '15.0',
+                                                   ceilings=[None, None, -1.0], wco=[-50.0, -60.0, 0.0])
+        self.assertEqual(commands, ['$J=G53 G21 Z-1.000 F1500.0', '$J=G90 G21 X0.0 Y0.0 F1500.0'])
+
+    def test_a_lift_that_is_low_enough_is_left_alone(self):
+        commands = ToolLevelling.grbl_jog_commands('origin', 'MM', '5.0', '1500.0', '15.0',
+                                                   ceilings=[-1.0, -1.0, -1.0], wco=[-50.0, -60.0, -40.0])
+        self.assertEqual(commands, ['$J=G90 G21 Z15.0 F1500.0', '$J=G90 G21 X0.0 Y0.0 F1500.0'])
+
+    def test_an_origin_at_the_switches_is_not_reached(self):
+        commands = ToolLevelling.grbl_jog_commands('origin', 'MM', '5.0', '1500.0', '15.0',
+                                                   ceilings=[-1.0, -1.0, -1.0], wco=[0.0, -60.0, -40.0])
+        self.assertEqual(commands[1], '$J=G53 G21 X-1.000 Y-60.000 F1500.0')
+
+    def test_a_step_up_stops_below_the_top(self):
+        ceilings = [None, None, -1.0]
+        self.assertEqual(ToolLevelling.grbl_jog_commands('zplus', 'MM', '5.0', '1500.0', '15.0',
+                                                         ceilings=ceilings, mpos=[0.0, 0.0, -3.0]),
+                         ['$J=G53 G21 Z-1.000 F1500.0'])
+        self.assertEqual(ToolLevelling.grbl_jog_commands('zplus', 'MM', '5.0', '1500.0', '15.0',
+                                                         ceilings=ceilings, mpos=[0.0, 0.0, -1.0]), [])
+        self.assertEqual(ToolLevelling.grbl_jog_commands('zminus', 'MM', '5.0', '1500.0', '15.0',
+                                                         ceilings=ceilings, mpos=[0.0, 0.0, -1.0]),
+                         ['$J=G91 G21 Z-5.0 F1500.0'])
+
+    def test_inch_moves_are_not_limited(self):
+        # the controller reports in mm, which an inch step is not compared with
+        self.assertEqual(ToolLevelling.grbl_jog_commands('zplus', 'IN', '0.5', '50.0', '0.6',
+                                                         ceilings=[None, None, -1.0], mpos=[0.0, 0.0, -1.0]),
+                         ['$J=G91 G20 Z0.5 F50.0'])
+
+
+class TestStatus(unittest.TestCase):
+    def setUp(self):
+        self.sender = make_sender(FakeGrbl())
+
+    def test_machine_position_and_offset(self):
+        self.sender.grbl_note_status('<Idle|MPos:-10.000,-20.000,-5.000|FS:0,0|WCO:-100.000,-50.000,-30.000>')
+        status = self.sender.grbl_status
+        self.assertEqual(status['state'], 'Idle')
+        self.assertEqual(status['mpos'], [-10.0, -20.0, -5.0])
+        self.assertEqual(status['wpos'], [90.0, 30.0, 25.0])
+        self.assertEqual(status['pins'], '')
+
+    def test_the_offset_is_kept_between_reports(self):
+        self.sender.grbl_note_status('<Idle|MPos:0.000,0.000,0.000|FS:0,0|WCO:-1.000,-2.000,-3.000>')
+        self.sender.grbl_note_status('<Jog|MPos:5.000,0.000,0.000|FS:500,0|Pn:Z>')
+        status = self.sender.grbl_status
+        self.assertEqual(status['wpos'], [6.0, 2.0, 3.0])
+        self.assertEqual(status['pins'], 'Z')
+
+    def test_work_position_reports(self):
+        # $10=0 reports the work position
+        self.sender.grbl_note_status('<Idle|WPos:1.000,2.000,3.000|FS:0,0|WCO:-10.000,-10.000,-10.000>')
+        self.assertEqual(self.sender.grbl_status['mpos'], [-9.0, -8.0, -7.0])
+
+    def test_a_limit_alarm_forgets_the_homing(self):
+        self.sender.grbl_homed = True
+        self.sender.grbl_note_lines(['ok', 'ALARM:1', '[MSG:Reset to continue]'])
+        self.assertFalse(self.sender.grbl_homed)
+
+    def test_the_display_polls_without_waiting(self):
+        grbl = self.sender.grbl_ser_port
+        grbl.chunk = 9
+        for _i in range(20):
+            self.sender.on_grbl_status_tick()
+        self.assertEqual(self.sender.grbl_status['mpos'], [0.0, 0.0, 0.0])
+        self.assertEqual(self.sender.ui.grbl_mpos_labels[2].get_value(), '0.000')
+
+    def test_the_display_shows_where_go_to_origin_goes(self):
+        grbl = self.sender.grbl_ser_port
+        self.sender.grbl_read_settings()
+        self.sender.grbl_homing()
+        grbl.wco = [-120.0, -80.0, 0.0]
+        self.sender.grbl_read_status()
+        self.sender.grbl_update_position_ui()
+
+        text = self.sender.ui.grbl_origin_label.get_value()
+        self.assertIn('machine X-120.000 Y-80.000 Z-1.000', text)
+        self.assertIn('limit switch on: Z', text)
+
+    def test_the_settings(self):
+        self.sender.grbl_read_settings()
+        self.assertEqual(self.sender.grbl_settings[27], '1.000')
+        self.assertEqual(self.sender.grbl_ceilings(), [None, None, None])
+        self.sender.grbl_homed = True
+        self.assertEqual(self.sender.grbl_ceilings(), [-1.0, -1.0, -1.0])
+        self.sender.grbl_settings[23] = '4'
+        self.assertEqual(self.sender.grbl_ceilings(), [-1.0, -1.0, None])
+
 
 class TestManualControl(unittest.TestCase):
     def setUp(self):
@@ -433,15 +565,19 @@ class TestManualControl(unittest.TestCase):
         self.sender.on_grbl_jog('origin')
         self.assertEqual(self.grbl.wpos, [0.0, 0.0, 15.0])
 
-    def test_a_refused_jog_is_reported_with_the_state(self):
+    def test_a_jog_in_an_alarm_is_not_sent(self):
         self.grbl.state = 'Alarm'
         self.sender.on_grbl_jog('xplus')
 
-        self.assertEqual(self.grbl.mpos, [0.0, 0.0, 0.0])
-        self.assertIn('rejected', self.sender.app.inform.text())
-        self.assertIn('alarm', self.sender.app.inform.text())
-        # the answer of the controller is in the shell even though the jogs are not echoed
-        self.assertIn('ERROR:8', self.sender.app.inform_shell.text())
+        self.assertEqual(self.grbl.sent('$J='), [])
+        self.assertIn('alarm state', self.sender.app.inform.text())
+        self.assertIn('Do Home', self.sender.app.inform.text())
+
+    def test_a_zero_in_a_hold_is_not_sent(self):
+        self.grbl.state = 'Hold:0'
+        self.assertFalse(self.sender.grbl_send_manual('G10 L20 P0 Z0'))
+        self.assertEqual(self.grbl.sent('G10'), [])
+        self.assertIn('Pause/Resume', self.sender.app.inform.text())
 
     def test_a_jog_past_the_soft_limits_is_reported(self):
         self.grbl.travel = ((-400.0, 0.0), (-400.0, 0.0), (-95.0, 0.0))
@@ -485,7 +621,8 @@ class TestManualControl(unittest.TestCase):
 
         self.assertTrue(self.sender.grbl_homing())
         self.assertEqual(self.grbl.state, 'Idle')
-        self.assertEqual(self.grbl.mpos, [0.0, 0.0, 0.0])
+        self.assertEqual(self.grbl.mpos, [-1.0, -1.0, -1.0])
+        self.assertTrue(self.sender.grbl_homed)
 
     def test_homing_that_is_disabled(self):
         self.grbl.settings[22] = '0'
@@ -573,13 +710,97 @@ class TestStopAndReset(unittest.TestCase):
         self.assertLess(result['took'], 2.0)
 
 
+class TestLimitSwitches(unittest.TestCase):
+    """A machine with hard limits, homed against its switches at the top, the back and the right."""
+
+    def setUp(self):
+        self.grbl = FakeGrbl()
+        self.grbl.hard_limits = True
+        self.grbl.settings[21] = '1'
+        self.sender = make_sender(self.grbl)
+        self.sender.grbl_read_settings()
+        self.assertTrue(self.sender.grbl_homing())
+
+    def crash(self):
+        # a move typed in the command box is not limited, it runs into the switch
+        self.sender.send_grbl_command('G0 X5', echo=False, timeout=3.0)
+        self.assertTrue(self.grbl.critical)
+        self.sender.app.inform.messages.clear()
+
+    def test_go_to_origin_without_a_work_origin_stays_off_the_switches(self):
+        # the work origin was never set, it is the machine origin, where the switches are
+        self.sender.on_grbl_jog('origin')
+
+        self.assertFalse(self.grbl.critical)
+        self.assertEqual(self.grbl.state, 'Idle')
+        self.assertEqual(self.grbl.mpos, [-1.0, -1.0, -1.0])
+
+    def test_go_to_origin_with_a_work_origin(self):
+        self.grbl.mpos = [-120.0, -80.0, -40.0]
+        self.sender.on_grbl_zero('all')
+        self.grbl.mpos = [-10.0, -10.0, -30.0]
+
+        self.sender.on_grbl_jog('origin')
+
+        self.assertFalse(self.grbl.critical)
+        self.assertEqual(self.grbl.mpos, [-120.0, -80.0, -25.0])
+
+    def test_steps_towards_the_switches_stop_short_of_them(self):
+        self.grbl.mpos = [-3.0, -3.0, -3.0]
+        for direction in ('xplus', 'yplus', 'zplus'):
+            self.sender.on_grbl_jog(direction)
+        self.assertFalse(self.grbl.critical)
+        self.assertEqual(self.grbl.mpos, [-1.0, -1.0, -1.0])
+
+        self.sender.on_grbl_jog('zplus')
+        self.assertEqual(self.grbl.mpos[2], -1.0)
+        self.assertIn('limit switch already', self.sender.app.inform.text())
+
+    def test_a_jog_after_a_limit_is_not_sent_and_does_not_hang(self):
+        self.crash()
+        jogs_before = len(self.grbl.sent('$J='))
+
+        started = time.monotonic()
+        self.sender.on_grbl_jog('xminus')
+
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertEqual(len(self.grbl.sent('$J=')), jogs_before)
+        self.assertIn('limit switch is pressed: X', self.sender.app.inform.text())
+
+    def test_do_home_after_a_limit(self):
+        self.crash()
+        self.assertFalse(self.sender.grbl_homed)
+
+        self.assertTrue(self.sender.grbl_homing())
+
+        self.assertIn('\x18', self.grbl.realtime)
+        self.assertEqual(self.grbl.state, 'Idle')
+        self.assertEqual(self.grbl.mpos, [-1.0, -1.0, -1.0])
+        self.assertTrue(self.sender.grbl_homed)
+
+    def test_unlock_after_a_limit(self):
+        self.crash()
+
+        self.assertTrue(self.sender.grbl_unlock())
+
+        self.assertIn('\x18', self.grbl.realtime)
+        self.assertEqual(self.grbl.state, 'Idle')
+        self.assertIn('still pressed: X', self.sender.app.inform.text())
+
+        # the machine can be jogged off the switch
+        self.sender.on_grbl_jog('xminus')
+        self.assertEqual(self.grbl.mpos[0], -5.0)
+        self.assertFalse(self.grbl.critical)
+
+
 class TestPanelState(unittest.TestCase):
     def setUp(self):
         self.sender = make_sender(FakeGrbl())
         self.ui = self.sender.ui
 
     def manual_controls(self):
-        return [self.ui.jog_wdg, self.ui.zero_axs_wdg, self.ui.probe_z_button, self.ui.grbl_command_entry,
+        return [self.ui.jog_wdg, self.ui.zero_axs_wdg, self.ui.probe_z_button, self.ui.grbl_unlock_button,
+                self.ui.grbl_command_entry,
                 self.ui.grbl_send_button, self.ui.grbl_report_button, self.ui.grbl_get_param_button]
 
     def test_idle(self):
@@ -711,7 +932,9 @@ class TestToolChangeJob(unittest.TestCase):
         self.assertIn('alarm state', self.sender.app.inform.text())
         self.assertTrue(thread.is_alive())
 
-        self.assertTrue(self.sender.grbl_send_manual('$X'))
+        self.assertTrue(self.sender.grbl_unlock())
+        # a probe alarm is cleared without a reset, which would throw away the job
+        self.assertNotIn('\x18', self.grbl.realtime)
         self.grbl.mpos[2] = -30.0
         self.grbl.surface_z = -43.0
         self.assertTrue(self.probe())

@@ -115,6 +115,28 @@ responsive while the machine moves.
 your work zero before you start, exactly as you would for any job. **Step** and **Feedrate** control
 the jog increment and speed.
 
+The top of the tab shows what the controller reports, four times a second:
+
+- **State**, green when idle, orange in a hold, red in an alarm, with the limit switches that are
+  pressed right now.
+- **Work**: the position relative to your work zero, the coordinates your job uses.
+- **Machine**: the position relative to where the machine homes.
+- **Origin**: where your work zero is, in machine coordinates. All zeros means no work zero was set
+  and the work coordinates are the machine coordinates.
+- **Go to origin**: where that button will take the tool, in machine and in work coordinates. It goes
+  to the travel height above the work zero first, then over the work zero.
+
+Once the machine was homed FlatCAM knows where the limit switches are, for the axes that home in the
+positive direction (the GRBL default, Z homes up): homing leaves them `$27` (the pull-off) short of the
+switch. **Go to origin** and the **X+**, **Y+** and **Z+** jogs then stop there instead of running into
+the switch, and the Go to origin line says so. Before a homing the display warns that the switches are
+not known; check the target it shows before you press the button.
+
+**Unlock** clears an alarm (`$X`). After a limit switch was hit GRBL takes nothing but a reset, so
+Unlock resets the controller first in that case. **Do Home** also resets first when the controller is
+in an alarm, and it is the better way out: it makes the position known again. Your work zero set with
+the Zero buttons or Probe Z survives the reset.
+
 The **Zero** buttons make the place the machine stands at right now the origin of the work coordinate
 system. They move nothing and they leave the machine coordinates alone, so jogging the tool down onto
 the surface and pressing **Zero Z** is a complete manual touch-off.
@@ -125,7 +147,7 @@ thickness** and lifts to the travel height. Leave **Plate thickness** at 0 when 
 bit and the copper itself is the contact; set it to the thickness of the plate when you probe onto a
 touch plate. Keep the feedrate low, 80 mm/min or less on a Masuter 3S. If the probe touches nothing
 within Probe travel, no origin is set, the failure is reported, and the controller is left in an
-alarm state that `$X` clears.
+alarm state that **Unlock** clears.
 
 **Sender tab.** Press **Apply AutoLevelling**. FlatCAM walks every probe point: it lifts to
 Probe Z travel, moves to the point, probes down at Probe Feedrate, and reads the height back from
@@ -343,11 +365,15 @@ uncorrected program.
 **Connect stays red.** No answer from the controller. Wrong port or baud rate, or another program
 has the port; the status bar names the reason the port could not be opened.
 
-**A jog or zero button does nothing.** Look at the shell and the status bar: the controller's answer
-and its state are reported there. `error:8` or `error:9` with an alarm state means the controller is
-locked; home it, or unlock it with `$X`. `error:15` means the jog would leave the travel the soft
-limits allow. **Go to origin** lifts to the travel height in work coordinates, so before Z zero is set
-on the work it can ask for a height above the top of the machine.
+**A jog or zero button does nothing.** Look at the status bar and the State on the Control tab. In an
+alarm or a hold nothing is sent and the status bar says which button gets you out: **Do Home** or
+**Unlock** for an alarm, **Pause/Resume** for a hold. `error:15` in the shell means the jog would leave
+the travel the soft limits allow.
+
+**The machine ran into a limit switch.** The State turns red, `ALARM:1` is printed in the shell and the
+switch is shown as pressed. Press **Do Home**: the controller is reset and homed and the position is
+known again. If homing is not possible, press **Unlock** and jog away from the switch in small steps;
+with hard limits on, releasing the switch can raise the alarm again, then home.
 
 **`error:20` from the controller.** An unsupported command. FlatCAM strips `M6` before sending, but
 a file you exported and ran in another sender still holds it; use the `GRBL_11_no_M6` or
@@ -356,7 +382,7 @@ a file you exported and ran in another sender still holds it; use the `GRBL_11_n
 **`ALARM:4` or `ALARM:5` after a tool change or a Probe Z.** The probe. `ALARM:5` means it never
 touched anything within the travel, `ALARM:4` means it was already triggered when the move started.
 Check the clip and that the travel reaches past the surface. The controller is in an alarm state
-afterwards and nothing was zeroed: unlock it with `$X` from the Control tab, set the tool length
+afterwards and nothing was zeroed: press **Unlock** on the Control tab, set the tool length
 again, then continue or resume.
 
 **Probe Z did nothing and reported a failure.** Same cause as above. The remaining commands are
