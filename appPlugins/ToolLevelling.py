@@ -72,6 +72,8 @@ class ToolLevelling(CNCjob, AppTool):
     grbl_job_finished_sig = QtCore.pyqtSignal()
     # a job stopped at a program pause and waits for the operator
     grbl_job_paused_sig = QtCore.pyqtSignal(str)
+    # a command that ran in the background, a homing or a probe, is done with the controller
+    grbl_busy_done_sig = QtCore.pyqtSignal()
 
     # a motion command: G0, G1, G2, G3 and their zero padded forms. It will not match G20, G21, G38.2 and such.
     motion_re = re.compile(r"G0*([0-3])(?!\d)", re.IGNORECASE)
@@ -166,6 +168,18 @@ class ToolLevelling(CNCjob, AppTool):
         self.grbl_rx_partial = b''
         # how long to wait for the controller to acknowledge a line of the job; a slow move takes a while
         self.grbl_job_line_timeout = 300.0
+        # set from the moment a job is sent until the streaming of it ended
+        self.grbl_job_running = False
+        # whether the last job ended before its last line, so that it can be resumed
+        self.grbl_can_resume = False
+        # how many commands are talking to the controller in the background; nothing else may read its answers
+        self.grbl_busy = 0
+        # counts the soft resets; an answer that is waited for will never come once the controller was reset
+        self.grbl_resets = 0
+
+        # connected once here and not with the other signals, which are connected again every time the UI is
+        # built: a second connection would end the busy state of two commands at once
+        self.grbl_busy_done_sig.connect(self.on_grbl_busy_done)
 
         self.probing_shapes = None
 
@@ -408,6 +422,11 @@ class ToolLevelling(CNCjob, AppTool):
             self.on_levelling_available(False)
 
         self.on_avoid_exc_holes(self.app.options["tools_al_avoid_exc_holes"])
+
+        # the connection outlives the panel; a panel that was built again has to show it
+        if self.grbl_is_connected():
+            self.grbl_set_connected_ui(True)
+            self.grbl_refresh_controls()
 
     def on_object_changed(self):
 
@@ -1543,7 +1562,43 @@ class ToolLevelling(CNCjob, AppTool):
         if muted is not True:
             self.app.inform.emit('[WARNING_NOTCL] %s' % _("COM list updated ..."))
 
+    def grbl_is_connected(self):
+        return self.grbl_ser_port is not None and self.grbl_ser_port.is_open
+
+    def grbl_set_connected_ui(self, connected):
+        """
+        Show whether the controller is connected and make the tabs that need it usable or not.
+
+        :param connected:   whether the controller is connected
+        :type connected:    bool
+        """
+        color = 'seagreen' if connected else 'red'
+        self.ui.com_connect_button.setStyleSheet("QPushButton {background-color: %s;}" % color)
+        self.ui.com_connect_button.setText(_("Connected") if connected else _("Disconnected"))
+        self.ui.controller_reset_button.setDisabled(not connected)
+
+        for idx in range(self.ui.al_toolbar.count()):
+            if self.ui.al_toolbar.tabText(idx) == _("Connect"):
+                self.ui.al_toolbar.tabBar.setTabTextColor(idx, QtGui.QColor(color))
+            if self.ui.al_toolbar.tabText(idx) in (_("Control"), _("Sender")):
+                self.ui.al_toolbar.tabBar.setTabEnabled(idx, connected)
+
     def on_grbl_connect(self):
+        if self.grbl_is_connected():
+            # the button toggles: a connected controller is disconnected
+            if self.grbl_job_running or self.grbl_busy:
+                self.app.inform.emit('[WARNING_NOTCL] %s' % _("Stop the job before disconnecting."))
+                return
+
+            port_name = self.grbl_ser_port.port
+            try:
+                self.grbl_ser_port.close()
+            except Exception as e:
+                self.app.log.error("ToolLevelling.on_grbl_connect() --> %s" % str(e))
+            self.grbl_set_connected_ui(False)
+            self.app.inform.emit("%s: %s" % (_("Disconnected from port"), port_name))
+            return
+
         port_name = self.ui.com_list_combo.currentText()
         if " (" in port_name:
             port_name = port_name.rpartition(" (")[0]
@@ -1575,42 +1630,22 @@ class ToolLevelling(CNCjob, AppTool):
             answer = self.on_grbl_wake()
             for line in answer:
                 if 'ok' in line.lower() or 'grbl' in line.lower():
-                    self.ui.com_connect_button.setStyleSheet("QPushButton {background-color: seagreen;}")
-                    self.ui.com_connect_button.setText(_("Connected"))
-                    self.ui.controller_reset_button.setDisabled(False)
-
-                    for idx in range(self.ui.al_toolbar.count()):
-                        if self.ui.al_toolbar.tabText(idx) == _("Connect"):
-                            self.ui.al_toolbar.tabBar.setTabTextColor(idx, QtGui.QColor('seagreen'))
-                        if self.ui.al_toolbar.tabText(idx) == _("Control"):
-                            self.ui.al_toolbar.tabBar.setTabEnabled(idx, True)
-                        if self.ui.al_toolbar.tabText(idx) == _("Sender"):
-                            self.ui.al_toolbar.tabBar.setTabEnabled(idx, True)
-
+                    self.grbl_set_connected_ui(True)
+                    self.grbl_refresh_controls()
                     self.app.inform.emit("%s: %s" % (_("Port connected"), port_name))
                     return
 
             self.grbl_ser_port.close()
+            self.grbl_set_connected_ui(False)
             self.app.inform.emit("[ERROR_NOTCL] %s: %s" % (_("Could not connect to GRBL on port"), port_name))
 
-        except serial.SerialException:
-            self.grbl_ser_port = serial.Serial()
-            self.grbl_ser_port.port = port_name
-            self.grbl_ser_port.close()
-            self.ui.com_connect_button.setStyleSheet("QPushButton {background-color: red;}")
-            self.ui.com_connect_button.setText(_("Disconnected"))
-            self.ui.controller_reset_button.setDisabled(True)
-
-            for idx in range(self.ui.al_toolbar.count()):
-                if self.ui.al_toolbar.tabText(idx) == _("Connect"):
-                    self.ui.al_toolbar.tabBar.setTabTextColor(idx, QtGui.QColor('red'))
-                if self.ui.al_toolbar.tabText(idx) == _("Control"):
-                    self.ui.al_toolbar.tabBar.setTabEnabled(idx, False)
-                if self.ui.al_toolbar.tabText(idx) == _("Sender"):
-                    self.ui.al_toolbar.tabBar.setTabEnabled(idx, False)
-            self.app.inform.emit("%s: %s" % (_("Port is connected. Disconnecting"), port_name))
-        except Exception:
-            self.app.inform.emit("[ERROR_NOTCL] %s: %s" % (_("Could not connect to port"), port_name))
+        except serial.SerialException as e:
+            # the port does not exist, or another program, a second FlatCAM for instance, holds it open
+            self.grbl_ser_port = None
+            self.grbl_set_connected_ui(False)
+            self.app.inform.emit("[ERROR_NOTCL] %s: %s (%s)" % (_("Could not connect to port"), port_name, str(e)))
+        except Exception as e:
+            self.app.inform.emit("[ERROR_NOTCL] %s: %s (%s)" % (_("Could not connect to port"), port_name, str(e)))
 
     def on_grbl_add_baudrate(self):
         new_bd = str(self.ui.new_baudrate_entry.get_value())
@@ -1664,9 +1699,22 @@ class ToolLevelling(CNCjob, AppTool):
         """
         deadline = time.monotonic() + timeout
         answer = []
+        # a line that was read before all of it arrived, a long one of a $$ answer for instance
+        partial = b''
+        resets = self.grbl_resets
 
         while time.monotonic() < deadline:
-            new_lines = self.grbl_decode(self.grbl_ser_port.readlines())
+            if self.grbl_resets != resets:
+                # the controller restarted and forgot the command
+                return answer, False
+
+            raw = self.grbl_ser_port.readlines()
+            if raw:
+                raw[0] = partial + raw[0]
+                partial = b''
+                if not raw[-1].endswith(b'\n'):
+                    partial = raw.pop()
+            new_lines = self.grbl_decode(raw)
             answer += [line for line in new_lines if line != '']
 
             for line in answer:
@@ -1682,15 +1730,14 @@ class ToolLevelling(CNCjob, AppTool):
 
     def on_grbl_send_command(self):
         cmd = self.ui.grbl_command_entry.get_value()
+        if not cmd or not self.grbl_is_connected():
+            return
 
         # show the Shell Dock
         self.app.ui.shell_dock.show()
 
-        def worker_task():
-            with self.app.proc_container.new('%s...' % _("Sending")):
-                self.send_grbl_command(command=cmd)
-
-        self.app.worker_task.emit({'fcn': worker_task, 'params': []})
+        # a command can take long to be acknowledged, a homing for instance, therefore it runs in the background
+        self.grbl_run_in_background(lambda: self.send_grbl_command(command=cmd, timeout=180.0))
 
     def send_grbl_command(self, command, echo=True, timeout=30.0):
         """
@@ -1716,7 +1763,10 @@ class ToolLevelling(CNCjob, AppTool):
         if not answer:
             self.app.inform_shell[str, bool].emit('\t\t\t: No answer\n', False)
 
-        if echo:
+        if not echo and not acknowledged and answer:
+            # a refusal is always shown, otherwise a button whose command was refused looks like it does nothing
+            self.app.inform_shell[str, bool].emit(cmd, False)
+        if echo or not acknowledged:
             for line in answer:
                 self.app.inform_shell.emit('\t\t\t: ' + line.upper())
 
@@ -1739,75 +1789,99 @@ class ToolLevelling(CNCjob, AppTool):
                     self.app.inform_shell.emit(' : ' + line.upper())
 
     def on_grbl_get_parameter(self, param):
-        if '$' in param:
-            param = param.replace('$', '')
+        param = str(param).replace('$', '').strip()
 
         snd = '$$\n'
         self.grbl_ser_port.write(snd.encode('utf-8'))
         answer, _ack = self.grbl_read_reply()
+        # an exact match: '$1' is also the start of '$10', '$11' and '$100'
+        par = '$%s=' % param
         for decoded_line in answer:
-            par = '$%s' % str(param)
-            if par in decoded_line:
-                result = float(decoded_line.rpartition('=')[2])
+            if decoded_line.startswith(par):
+                try:
+                    result = float(decoded_line.partition('=')[2].split()[0])
+                except (ValueError, IndexError):
+                    continue
                 self.app.shell_message("GRBL Parameter: %s = %s" % (str(param), str(result)), show=True)
                 return result
 
-    def on_grbl_jog(self, direction=None):
-        if direction is None:
-            return
-        cmd = ''
+        self.app.inform.emit('[WARNING_NOTCL] %s: $%s' % (_("The GRBL controller did not report the parameter"),
+                                                          param))
+        return None
 
-        step = self.ui.jog_step_entry.get_value()
-        feedrate = self.ui.jog_fr_entry.get_value()
-        travelz = float(self.app.options["tools_al_grbl_travelz"])
+    @staticmethod
+    def grbl_jog_commands(direction, units, step, feedrate, travelz):
+        """
+        The jog commands that move the machine one step in a direction, or back to the work origin.
 
-        if direction == 'xplus':
-            cmd = "$J=G91 %s X%s F%s" % ({'IN': 'G20', 'MM': 'G21'}[self.units], str(step), str(feedrate))
-        if direction == 'xminus':
-            cmd = "$J=G91 %s X-%s F%s" % ({'IN': 'G20', 'MM': 'G21'}[self.units], str(step), str(feedrate))
-        if direction == 'yplus':
-            cmd = "$J=G91 %s Y%s F%s" % ({'IN': 'G20', 'MM': 'G21'}[self.units], str(step), str(feedrate))
-        if direction == 'yminus':
-            cmd = "$J=G91 %s Y-%s F%s" % ({'IN': 'G20', 'MM': 'G21'}[self.units], str(step), str(feedrate))
-
-        if direction == 'zplus':
-            cmd = "$J=G91 %s Z%s F%s" % ({'IN': 'G20', 'MM': 'G21'}[self.units], str(step), str(feedrate))
-        if direction == 'zminus':
-            cmd = "$J=G91 %s Z-%s F%s" % ({'IN': 'G20', 'MM': 'G21'}[self.units], str(step), str(feedrate))
+        :param direction:   'xplus', 'xminus', 'yplus', 'yminus', 'zplus', 'zminus' or 'origin'
+        :type direction:    str
+        :param units:       'MM' or 'IN'
+        :type units:        str
+        :param step:        the length of a step
+        :type step:         str
+        :param feedrate:    the feedrate of the jog
+        :type feedrate:     str
+        :param travelz:     the height to lift to before going to the origin, in work coordinates
+        :type travelz:      str
+        :return:            the commands, in the order they are to be sent; none for an unknown direction
+        :rtype:             list
+        """
+        unit_code = {'IN': 'G20', 'MM': 'G21'}[units]
 
         if direction == 'origin':
-            cmd = "$J=G90 %s Z%s F%s" % ({'IN': 'G20', 'MM': 'G21'}[self.units], str(travelz), str(feedrate))
-            if self.grbl_send_jog(cmd) is False:
+            # lifted first, so that the tool is not dragged over the work on the way
+            return [
+                '$J=G90 %s Z%s F%s' % (unit_code, travelz, feedrate),
+                '$J=G90 %s X0.0 Y0.0 F%s' % (unit_code, feedrate)
+            ]
+
+        move = {
+            'xplus': 'X%s', 'xminus': 'X-%s',
+            'yplus': 'Y%s', 'yminus': 'Y-%s',
+            'zplus': 'Z%s', 'zminus': 'Z-%s',
+        }.get(direction)
+        if move is None:
+            return []
+        return ['$J=G91 %s %s F%s' % (unit_code, move % step, feedrate)]
+
+    def on_grbl_jog(self, direction=None):
+        commands = self.grbl_jog_commands(
+            direction=direction,
+            units=self.units,
+            step=str(self.ui.jog_step_entry.get_value()),
+            feedrate=str(self.ui.jog_fr_entry.get_value()),
+            travelz=str(float(self.app.options["tools_al_grbl_travelz"]))
+        )
+
+        for command in commands:
+            if self.grbl_send_manual(command) is False:
                 return
-            cmd = "$J=G90 %s X0.0 Y0.0 F%s" % ({'IN': 'G20', 'MM': 'G21'}[self.units], str(feedrate))
-            self.grbl_send_jog(cmd)
-            return
 
-        self.grbl_send_jog(cmd)
-
-    def grbl_send_jog(self, command):
+    def grbl_send_manual(self, command):
         """
-        Send a jog command and say so when the controller refused it. A jog that is out of the machine travel
-        or one that is sent while the controller holds is answered with an error and the machine does not move,
-        which without this looks like a button that does nothing.
+        Send a command that the operator gave by pressing a button and say so when the controller refused it.
+        A jog that is out of the machine travel, or anything sent while the controller is in an alarm, is
+        answered with an error and the machine does not move, which without this looks like a button that does
+        nothing.
 
-        :param command: the jog command
+        :param command: the command
         :type command:  str
-        :return:        True when the controller accepted the jog
+        :return:        True when the controller accepted the command
         :rtype:         bool
         """
-        if self.grbl_ser_port is None or not self.grbl_ser_port.is_open:
+        if not self.grbl_is_connected():
             self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller is not connected."))
             return False
 
         if self.send_grbl_command(command=command, echo=False):
             return True
 
-        # the state says why: an alarm has to be cleared with $X, a hold with the Pause/Resume button, and a
-        # jog that is refused while the machine is idle was out of the travel the soft limits allow
+        # the state says why: an alarm has to be cleared with $X or a homing, a hold with the Pause/Resume
+        # button, and a jog that is refused while the machine is idle was out of the travel the soft limits allow
         state = self.grbl_read_status()
         self.app.inform.emit('[ERROR_NOTCL] %s: %s (%s: %s)' % (
-            _("The GRBL controller rejected the jog"), command, _("state"), state if state else _("unknown")))
+            _("The GRBL controller rejected the command"), command, _("state"), state if state else _("unknown")))
         return False
 
     @staticmethod
@@ -1827,18 +1901,10 @@ class ToolLevelling(CNCjob, AppTool):
         return 'G10 L20 P0 %s' % {'x': 'X0', 'y': 'Y0', 'z': 'Z0'}.get(axis, 'X0 Y0 Z0')
 
     def on_grbl_zero(self, axis):
-        current_mode = self.on_grbl_get_parameter('10')
-        if current_mode is None:
-            return
-
-        cmd = '$10=0'
-        self.send_grbl_command(command=cmd, echo=False)
-
-        self.send_grbl_command(command=self.grbl_zero_command(axis), echo=False)
-
-        # restore previous mode
-        cmd = '$10=%d' % int(current_mode)
-        self.send_grbl_command(command=cmd, echo=False)
+        # G10 L20 does not depend on how the status is reported, therefore the $10 setting is left alone; changing
+        # it would write the settings memory of the controller twice for every press
+        if self.grbl_send_manual(self.grbl_zero_command(axis)):
+            self.app.inform.emit('[success] %s' % _("The work origin was set at the current position."))
 
     @staticmethod
     def grbl_probe_z_commands(units, travel, feedrate, thickness, lift):
@@ -1875,7 +1941,7 @@ class ToolLevelling(CNCjob, AppTool):
         Probe down for the surface and make the touch point the Z origin, which sets the length of the tool
         that was just mounted.
         """
-        if self.grbl_ser_port is None or not self.grbl_ser_port.is_open:
+        if not self.grbl_is_connected():
             self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller is not connected."))
             return
 
@@ -1890,44 +1956,141 @@ class ToolLevelling(CNCjob, AppTool):
             lift=str(self.app.options["tools_al_grbl_travelz"])
         )
 
-        def probe_task():
-            self.app.inform.emit('%s' % _("Probing for the surface."))
+        self.grbl_run_in_background(lambda: self.grbl_probe_z(commands))
 
-            for command in commands:
-                output = self.send_grbl_command(command=command, timeout=120.0)
-                if not output:
-                    self.app.inform.emit('[ERROR_NOTCL] %s: %s' % (_("The GRBL controller rejected the line"),
-                                                                   command))
-                    return
+    def grbl_probe_z(self, commands):
+        """
+        Send the touch off commands and stop at the first one that fails.
 
-                if command.startswith('G91') and self.parse_probe_answer(output) is None:
-                    # the probe did not touch anything; the controller is in an alarm state and the distance
-                    # mode is still relative, therefore nothing more is sent
-                    self.app.inform.emit(
-                        '[ERROR_NOTCL] %s' % _("The probe did not touch the surface. Unlock the controller "
-                                               "with $X and set the distance mode back with G90.")
-                    )
-                    return
+        :param commands:    as they come out of grbl_probe_z_commands()
+        :type commands:     list
+        :return:            True when the tool length was set
+        :rtype:             bool
+        """
+        self.app.inform.emit('%s' % _("Probing for the surface."))
 
-            self.app.inform.emit('[success] %s' % _("The tool length was set."))
+        for command in commands:
+            output = self.send_grbl_command(command=command, timeout=120.0)
 
-        # a thread of its own and not a worker task: the worker that streams a job holds one of the few threads
-        # of the pool, and a probe that is queued there would only run after the job was continued
-        threading.Thread(target=probe_task, daemon=True).start()
+            if 'G38' in command and self.parse_probe_answer(output) is None:
+                # the probe did not touch anything; the controller is in an alarm state and the distance mode
+                # is still relative, therefore nothing more is sent and the origin keeps the value it had
+                self.app.inform.emit(
+                    '[ERROR_NOTCL] %s' % _("The probe did not touch the surface. Unlock the controller "
+                                           "with $X and set the distance mode back with G90.")
+                )
+                return False
+
+            if not output:
+                self.app.inform.emit('[ERROR_NOTCL] %s: %s' % (_("The GRBL controller rejected the line"), command))
+                return False
+
+        self.app.inform.emit('[success] %s' % _("The tool length was set."))
+        return True
 
     def on_grbl_homing(self):
-        cmd = '$H'
+        if not self.grbl_is_connected():
+            return
+
         self.app.inform.emit("%s" % _("GRBL is doing a home cycle."))
-        self.on_grbl_wake()
-        self.send_grbl_command(command=cmd)
+        self.app.ui.shell_dock.show()
+        self.grbl_run_in_background(self.grbl_homing)
+
+    def grbl_homing(self):
+        """
+        Run a homing cycle. The controller only acknowledges it once the machine reached its home position,
+        which on a large machine takes a while.
+
+        :return:    True when the machine is homed
+        :rtype:     bool
+        """
+        resets = self.grbl_resets
+        self.grbl_ser_port.reset_input_buffer()
+
+        if self.send_grbl_command(command='$H', timeout=180.0):
+            self.app.inform.emit('[success] %s' % _("The machine is homed."))
+            return True
+
+        if self.grbl_resets == resets:
+            self.app.inform.emit(
+                '[ERROR_NOTCL] %s' % _("The homing cycle failed. The answer of the controller is in the shell; "
+                                       "error:5 means that homing is disabled with $22=0."))
+        return False
 
     def on_grbl_reset(self):
-        cmd = '\x18'
+        """
+        Soft reset the controller. It is also the way to stop the machine at once, therefore it is written before
+        anything else and nothing waits for it.
+        """
+        if not self.grbl_is_connected():
+            return
+
+        # the controller forgets everything it was given, a job that is being sent cannot go on
+        self.grbl_job_stop = True
+        self.grbl_job_waiting = False
+        self.grbl_resets += 1
+        try:
+            self.grbl_ser_port.write(b'\x18')
+        except Exception as e:
+            self.app.log.error("ToolLevelling.on_grbl_reset() --> %s" % str(e))
+            return
+
+        self.ui.pause_resume_button.setChecked(False)
         self.app.inform.emit("%s" % _("GRBL software reset was sent."))
-        self.on_grbl_wake()
-        self.send_grbl_command(command=cmd)
+        self.grbl_run_in_background(self.grbl_report_after_reset)
+
+    def grbl_report_after_reset(self):
+        """
+        Wait for the controller to restart and tell the operator the state it came up in.
+        """
+        # the controller prints its welcome message once it restarted
+        time.sleep(1.5)
+        self.grbl_ser_port.reset_input_buffer()
+
+        state = self.grbl_read_status()
+        if state is None:
+            self.app.inform.emit('[WARNING_NOTCL] %s' % _("The GRBL controller did not answer after the reset."))
+        elif state.startswith('alarm'):
+            self.app.inform.emit(
+                '[WARNING_NOTCL] %s' % _("The GRBL controller is in an alarm state after the reset. "
+                                         "Home the machine, or unlock it with $X."))
+        else:
+            self.app.inform.emit('%s: %s' % (_("GRBL state"), state))
+
+    def grbl_run_in_background(self, task):
+        """
+        Run something that talks to the controller for a while, a homing or a probe, without blocking the GUI.
+        Everything else that reads the answers of the controller is disabled until it is done.
+
+        A thread of its own and not a worker task: the worker that streams a job holds one of the few threads of
+        the pool, and a probe at a tool change that is queued there would only run after the job was continued.
+
+        :param task:    what to run
+        :type task:     callable
+        """
+        self.grbl_busy += 1
+        self.grbl_refresh_controls()
+
+        def run():
+            try:
+                task()
+            except Exception as e:
+                self.app.log.error("ToolLevelling.grbl_run_in_background() --> %s" % str(e))
+                self.app.inform.emit('[ERROR_NOTCL] %s' % str(e))
+            finally:
+                self.grbl_busy_done_sig.emit()
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def on_grbl_busy_done(self):
+        self.grbl_busy = max(0, self.grbl_busy - 1)
+        self.grbl_refresh_controls()
 
     def on_grbl_pause_resume(self, checked):
+        if not self.grbl_is_connected():
+            self.ui.pause_resume_button.setChecked(False)
+            return
+
         # feed hold and cycle start are realtime commands that the controller does not acknowledge, therefore
         # they are written directly: waiting for an answer that never comes would block for the whole timeout
         # and would take the answers that a job which is being streamed waits for
@@ -2246,7 +2409,17 @@ class ToolLevelling(CNCjob, AppTool):
         # show the Shell Dock
         self.app.ui.shell_dock.show()
 
+        # the probing reads the answers of the controller; nothing else may do it meanwhile
+        self.grbl_busy += 1
+        self.grbl_refresh_controls()
+
         def worker_task():
+            try:
+                probe_and_level()
+            finally:
+                self.grbl_busy_done_sig.emit()
+
+        def probe_and_level():
             with self.app.proc_container.new('%s...' % _("Sending")):
                 self.grbl_probe_result = ''
                 pr_travelz = str(self.ui.ptravelz_entry.get_value())
@@ -2359,8 +2532,11 @@ class ToolLevelling(CNCjob, AppTool):
             self.app.inform.emit('[ERROR_NOTCL] %s' % _("There is no GCode to send."))
             return
 
-        if self.grbl_ser_port is None or not self.grbl_ser_port.is_open:
+        if not self.grbl_is_connected():
             self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller is not connected."))
+            return
+
+        if self.grbl_job_running or self.grbl_busy:
             return
 
         # show the Shell Dock
@@ -2368,11 +2544,8 @@ class ToolLevelling(CNCjob, AppTool):
 
         self.grbl_job_stop = False
         self.grbl_job_waiting = False
-        self.ui.grbl_send_job_button.setDisabled(True)
-        self.ui.grbl_stop_job_button.setDisabled(False)
-        self.ui.grbl_continue_button.setDisabled(True)
-        self.ui.grbl_resume_job_button.setDisabled(True)
-        self.on_grbl_manual_control(False)
+        self.grbl_job_running = True
+        self.grbl_refresh_controls()
 
         def worker_task():
             with self.app.proc_container.new('%s...' % _("Sending")):
@@ -2393,13 +2566,37 @@ class ToolLevelling(CNCjob, AppTool):
         """
         Tell the operator what the machine waits for at a program pause.
         """
-        self.ui.grbl_continue_button.setDisabled(False)
         self.ui.grbl_job_progress_label.set_value(message)
         self.app.inform.emit('[WARNING_NOTCL] %s' % message)
 
         # the machine stands still and the streaming thread is not reading the port, therefore the tool can be
         # changed, the machine jogged and the new tool touched off
-        self.on_grbl_manual_control(True)
+        self.grbl_refresh_controls()
+
+    def grbl_refresh_controls(self):
+        """
+        Make usable what can be used in the state the sender is in, and nothing else.
+
+        The answers of the controller can only be read by one at a time: by the thread that streams a job, by a
+        command that runs in the background, or by a button pressed by hand. A job that waits at a program pause
+        does not read the port, therefore the machine can be operated by hand meanwhile.
+        """
+        streaming = self.grbl_job_running and not self.grbl_job_waiting
+        busy = self.grbl_busy > 0
+        manual = not busy and not streaming
+
+        self.on_grbl_manual_control(manual)
+        self.ui.grbl_send_job_button.setDisabled(busy or self.grbl_job_running)
+        self.ui.grbl_stop_job_button.setDisabled(not self.grbl_job_running)
+        self.ui.grbl_continue_button.setDisabled(busy or not (self.grbl_job_running and self.grbl_job_waiting))
+        self.ui.grbl_resume_job_button.setDisabled(busy or self.grbl_job_running or not self.grbl_can_resume)
+
+        if manual and not self.grbl_job_running:
+            self.on_levelling_available(self.can_be_levelled(
+                self.app.collection.get_by_name(self.ui.object_combo.get_value())))
+        else:
+            # probing the surface in the middle of a job would take the place of the rest of it
+            self.ui.grbl_get_heightmap_button.setDisabled(True)
 
     def on_grbl_manual_control(self, enabled):
         """
@@ -2437,44 +2634,71 @@ class ToolLevelling(CNCjob, AppTool):
 
         # nothing has to be released: the pause was never sent to the controller, therefore the machine is
         # only waiting for the next line
-        self.ui.grbl_continue_button.setDisabled(True)
-        self.on_grbl_manual_control(False)
         self.grbl_job_waiting = False
+        self.grbl_refresh_controls()
         self.app.inform.emit('%s' % _("The job continues."))
 
     def on_grbl_job_finished(self):
-        self.ui.grbl_send_job_button.setDisabled(False)
-        self.ui.grbl_stop_job_button.setDisabled(True)
-        self.ui.grbl_continue_button.setDisabled(True)
-
-        # the machine is free again, therefore it can be moved by hand and the levelling of the selected object
-        # is available once more
-        self.on_grbl_manual_control(True)
-        self.on_levelling_available(self.can_be_levelled(
-            self.app.collection.get_by_name(self.ui.object_combo.get_value())))
+        self.grbl_job_running = False
+        self.grbl_job_waiting = False
 
         # a job that did not run to its end can be resumed from the line that follows the last one the
         # controller acknowledged
         resume_from = self.grbl_job_last_ack + 1
-        can_resume = 1 < resume_from <= len(self.grbl_job_lines)
-        self.ui.grbl_resume_job_button.setDisabled(not can_resume)
-        if can_resume:
+        self.grbl_can_resume = 1 < resume_from <= len(self.grbl_job_lines)
+        if self.grbl_can_resume:
             self.ui.grbl_resume_line_entry.set_value(resume_from)
+
+        # the machine is free again, therefore it can be moved by hand and the levelling of the selected object
+        # is available once more
+        self.grbl_refresh_controls()
 
     def on_grbl_stop_job(self):
         """
-        Hold the machine and stop sending the job.
+        Stop the machine and the sending of the job.
         """
+        if not self.grbl_job_running:
+            return
+
         self.grbl_job_stop = True
         self.grbl_job_waiting = False
         try:
-            # feed hold; the job is not resumed, the remaining lines are not sent. It is a realtime command that
-            # the controller does not acknowledge and reading the port here would take the answers that the
-            # thread which streams the job waits for.
-            self.grbl_ser_port.write('!'.encode('utf-8'))
+            # feed hold first: it brings the machine to a controlled stop without losing its position. It is a
+            # realtime command that the controller does not acknowledge and reading the port here would take
+            # the answers that the thread which streams the job waits for.
+            self.grbl_ser_port.write(b'!')
         except Exception as e:
             self.app.log.error("ToolLevelling.on_grbl_stop_job() --> %s" % str(e))
+            return
+
+        self.ui.pause_resume_button.setChecked(False)
         self.app.inform.emit('[WARNING_NOTCL] %s' % _("Sending the job was stopped."))
+        self.grbl_run_in_background(self.grbl_finish_stop)
+
+    def grbl_finish_stop(self, timeout=30.0):
+        """
+        Throw away the rest of the job the controller holds. A held controller still has the lines it was given
+        and would move on with them at the next cycle start, and it refuses to jog. A soft reset is the only way
+        to empty its buffers; once the machine came to a stop it does not cost the position.
+        """
+        deadline = time.monotonic() + timeout
+        # the thread that streams the job is still reading the port for a moment
+        time.sleep(0.3)
+
+        while time.monotonic() < deadline:
+            state = self.grbl_read_status()
+            if state is not None and (state.startswith('hold:0') or state.startswith('idle') or
+                                      state.startswith('alarm') or state.startswith('door')):
+                break
+
+        self.grbl_resets += 1
+        try:
+            self.grbl_ser_port.write(b'\x18')
+        except Exception as e:
+            self.app.log.error("ToolLevelling.grbl_finish_stop() --> %s" % str(e))
+            return
+
+        self.grbl_report_after_reset()
 
     @staticmethod
     def grbl_extract_message(gcode_line):
@@ -2651,6 +2875,9 @@ class ToolLevelling(CNCjob, AppTool):
 
             response = self.grbl_next_response(pending, timeout=self.grbl_job_line_timeout)
             if response is None:
+                if self.grbl_job_stop is True:
+                    # the operator stopped the job; that is not a controller that went silent
+                    return False
                 self.app.inform.emit(
                     '[ERROR_NOTCL] %s %d' % (_("The GRBL controller did not answer for line"),
                                              in_flight[0][0] if in_flight else 0)
@@ -2688,6 +2915,7 @@ class ToolLevelling(CNCjob, AppTool):
         :rtype:         str or None
         """
         deadline = time.monotonic() + timeout
+        partial = b''
 
         # a status report is asked for; it is a realtime command that is not acknowledged with 'ok'
         self.grbl_ser_port.write('?'.encode('utf-8'))
@@ -2695,7 +2923,14 @@ class ToolLevelling(CNCjob, AppTool):
         while time.monotonic() < deadline:
             time.sleep(0.1)
 
-            for response in self.grbl_decode(self.grbl_ser_port.readlines()):
+            raw = self.grbl_ser_port.readlines()
+            if raw:
+                raw[0] = partial + raw[0]
+                partial = b''
+                if not raw[-1].endswith(b'\n'):
+                    partial = raw.pop()
+
+            for response in self.grbl_decode(raw):
                 stripped = response.strip()
                 if stripped.startswith('<'):
                     return stripped[1:].split('|')[0].strip().lower()

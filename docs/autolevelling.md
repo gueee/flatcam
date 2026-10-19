@@ -102,7 +102,14 @@ Select **GRBL** as the controller. Three tabs appear.
 for most GRBL boards; use **New** and **Add** if your rate is not listed), then press
 **Disconnected** to connect. The button turns green and reads **Connected** only after the
 controller actually answers, and the Control and Sender tabs unlock. If it stays red, the port is
-wrong, the board is busy, or another program is holding the port open.
+wrong, the board is busy, or another program is holding the port open. Press it again to disconnect;
+that is refused while a job is being sent.
+
+A command the controller refuses is never silent: its answer, `error:15` for a jog past the soft
+limits for instance, is printed in the shell, and the status bar says which state the controller was
+in, so you can tell an alarm that needs `$X` or a homing from a hold that needs **Pause/Resume**.
+Homing, **Probe Z** and commands typed in the command box run in the background, so the window stays
+responsive while the machine moves.
 
 **Control tab.** Jog the machine, zero an axis, run a homing cycle, touch off a tool. Use this to set
 your work zero before you start, exactly as you would for any job. **Step** and **Feedrate** control
@@ -224,7 +231,7 @@ preprocessor talks to the operator.
 | Control | What it does |
 |---|---|
 | **Pause/Resume** (Control tab) | Holds and releases the machine mid-job. |
-| **Stop** | Holds the machine and stops sending. The remaining lines are not sent. |
+| **Stop** | Brings the machine to a controlled stop, then soft-resets the controller so it throws away the lines it still holds. The position is kept. |
 | **Continue** | Lets a job that stopped at a program pause, a tool change for instance, carry on. |
 | **Resume from line** | Sends the job again starting at the given line, restoring the state first. |
 
@@ -233,6 +240,14 @@ buttons, homing, **Probe Z**, the custom command box, **Get Report** and **Get P
 read the controller's replies, and one of those pressed mid-stream would swallow an acknowledgement
 the sender is counting. They come back as soon as the job stops at a program pause or ends. **Stop**,
 **Pause/Resume** and the controller **Reset** stay available at all times.
+
+**Stop** does more than stop sending. A held GRBL still has up to 128 bytes of the job in its buffer
+and would carry on with them at the next cycle start, and it refuses to jog while it holds. So after
+the feed hold has brought the machine to rest, FlatCAM soft-resets the controller, which empties the
+buffer. A reset at rest does not cost the position, and the status bar reports the state the
+controller came back in. **Reset** resets at once, without the controlled stop first: it is the
+emergency button, and a reset in mid-move costs the position, so the controller will want a homing
+afterwards.
 
 If the controller reports an `error:` or an `ALARM:`, the stream stops and the message appears in the
 shell together with the line that caused it. Long moves can take a while to acknowledge, which is
@@ -304,8 +319,10 @@ move cannot drag the tool through the material.
 
 Two things it cannot do for you. If the resume line is itself a plunge or a cut, the tool goes
 straight back down to depth at that point, so pick a line at the start of a path rather than in the
-middle of one. And if the controller was reset or powered down in between, the `G92` tool length and
-your work zero are gone and have to be set again before resuming means anything.
+middle of one. And if the controller was reset, which **Stop** does, or powered down in between, a
+`G92` tool length that `Toolchange_Probe_GRBL` set is gone and has to be probed again. A work zero set
+with the Zero buttons or **Probe Z** is not affected: those write the `G54` offset, which GRBL keeps
+in its settings memory through resets and power cycles.
 
 ## Troubleshooting
 
@@ -324,7 +341,13 @@ preprocessors, whose output is not G-code.
 uncorrected program.
 
 **Connect stays red.** No answer from the controller. Wrong port or baud rate, or another program
-has the port.
+has the port; the status bar names the reason the port could not be opened.
+
+**A jog or zero button does nothing.** Look at the shell and the status bar: the controller's answer
+and its state are reported there. `error:8` or `error:9` with an alarm state means the controller is
+locked; home it, or unlock it with `$X`. `error:15` means the jog would leave the travel the soft
+limits allow. **Go to origin** lifts to the travel height in work coordinates, so before Z zero is set
+on the work it can ask for a height above the top of the machine.
 
 **`error:20` from the controller.** An unsupported command. FlatCAM strips `M6` before sending, but
 a file you exported and ran in another sender still holds it; use the `GRBL_11_no_M6` or
