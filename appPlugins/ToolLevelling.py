@@ -69,6 +69,8 @@ class ToolLevelling(CNCjob, AppTool):
     build_al_table_sig = QtCore.pyqtSignal()
     grbl_job_progress_sig = QtCore.pyqtSignal(str)
     grbl_job_finished_sig = QtCore.pyqtSignal()
+    # a job stopped at a program pause and waits for the operator
+    grbl_job_paused_sig = QtCore.pyqtSignal(str)
 
     # a motion command: G0, G1, G2, G3 and their zero padded forms. It will not match G20, G21, G38.2 and such.
     motion_re = re.compile(r"G0*([0-3])(?!\d)", re.IGNORECASE)
@@ -76,6 +78,30 @@ class ToolLevelling(CNCjob, AppTool):
     coord_re = re.compile(r"([XYZ])\s*([-+]?\d*\.?\d+)", re.IGNORECASE)
     # the answer of the GRBL controller to a probing command: [PRB:0.000,0.000,-1.234:1]
     prb_re = re.compile(r"\[PRB:\s*([-+]?[\d.]+)\s*,\s*([-+]?[\d.]+)\s*,\s*([-+]?[\d.]+)\s*:\s*(\d)]")
+    # a comment; GRBL ignores them but they would still take up room in its receive buffer
+    comment_re = re.compile(r"\(.*?\)", re.DOTALL)
+    # the text that a preprocessor addresses to the operator: (MSG, Change to Tool Dia = 0.8)
+    msg_re = re.compile(r"\(\s*MSG\s*,?\s*(.*?)\s*\)", re.IGNORECASE | re.DOTALL)
+    # the tool change word; GRBL does not support it and answers a line that holds it with error:20
+    m6_re = re.compile(r"M0*6\b", re.IGNORECASE)
+    # a program pause: M0 and M1 and their zero padded forms
+    pause_re = re.compile(r"M0*[01]\b", re.IGNORECASE)
+    # the word that sets the feed rate
+    feed_re = re.compile(r"F\s*([-+]?\d*\.?\d+)", re.IGNORECASE)
+    # the word that sets the spindle speed
+    speed_re = re.compile(r"S\s*(\d*\.?\d+)", re.IGNORECASE)
+    # the state of the spindle: M3 and M4 start it, M5 stops it
+    spindle_re = re.compile(r"M0*([345])\b", re.IGNORECASE)
+    # the modal commands whose last occurrence has to be restored before a job is resumed
+    modal_groups = (
+        ('G20', 'G21'),                                 # units
+        ('G90', 'G91'),                                 # distance mode
+        ('G93', 'G94'),                                 # feed rate mode
+        ('G17', 'G18', 'G19'),                          # plane selection
+        ('G54', 'G55', 'G56', 'G57', 'G58', 'G59'),     # work coordinate system
+    )
+    # GRBL has a 128 byte serial receive buffer of which one slot is always left empty
+    grbl_rx_buffer = 127
 
     def __init__(self, app):
         self.app = app
@@ -129,6 +155,14 @@ class ToolLevelling(CNCjob, AppTool):
 
         # set when the user stops a job that is being sent to the GRBL controller
         self.grbl_job_stop = False
+        # set while a job waits for the operator to act on a program pause, a tool change for instance
+        self.grbl_job_waiting = False
+        # the lines of the job that is being sent, kept so that a job that did not finish can be resumed
+        self.grbl_job_lines = []
+        # the number of the last line of the job that the controller acknowledged
+        self.grbl_job_last_ack = 0
+        # an answer of the controller that was read before all of it arrived
+        self.grbl_rx_partial = b''
         # how long to wait for the controller to acknowledge a line of the job; a slow move takes a while
         self.grbl_job_line_timeout = 300.0
 
@@ -209,6 +243,7 @@ class ToolLevelling(CNCjob, AppTool):
         self.build_al_table_sig.connect(self.build_al_table)
         self.grbl_job_progress_sig.connect(self.on_grbl_job_progress)
         self.grbl_job_finished_sig.connect(self.on_grbl_job_finished)
+        self.grbl_job_paused_sig.connect(self.on_grbl_job_paused)
         self.ui.level.toggled.connect(self.on_level_changed)
 
         self.ui.avoid_exc_holes_cb.toggled.connect(self.on_avoid_exc_holes)
@@ -252,8 +287,11 @@ class ToolLevelling(CNCjob, AppTool):
         self.ui.pause_resume_button.clicked.connect(self.on_grbl_pause_resume)
         self.ui.grbl_get_heightmap_button.clicked.connect(self.on_grbl_autolevel)
         self.ui.grbl_save_height_map_button.clicked.connect(self.on_grbl_heightmap_save)
-        self.ui.grbl_send_job_button.clicked.connect(self.on_grbl_send_job)
+        # the lambda keeps the checked state that clicked() carries out of the start line parameter
+        self.ui.grbl_send_job_button.clicked.connect(lambda: self.on_grbl_send_job())
         self.ui.grbl_stop_job_button.clicked.connect(self.on_grbl_stop_job)
+        self.ui.grbl_continue_button.clicked.connect(self.on_grbl_continue_job)
+        self.ui.grbl_resume_job_button.clicked.connect(self.on_grbl_resume_job)
 
         # When object selection on canvas change
         self.app.proj_selection_changed.connect(self.on_object_selection_changed)
@@ -1744,13 +1782,14 @@ class ToolLevelling(CNCjob, AppTool):
         self.send_grbl_command(command=cmd)
 
     def on_grbl_pause_resume(self, checked):
+        # feed hold and cycle start are realtime commands that the controller does not acknowledge, therefore
+        # they are written directly: waiting for an answer that never comes would block for the whole timeout
+        # and would take the answers that a job which is being streamed waits for
         if checked is False:
-            cmd = '~'
-            self.send_grbl_command(command=cmd)
+            self.grbl_ser_port.write('~'.encode('utf-8'))
             self.app.inform.emit("%s" % _("GRBL resumed."))
         else:
-            cmd = '!'
-            self.send_grbl_command(command=cmd)
+            self.grbl_ser_port.write('!'.encode('utf-8'))
             self.app.inform.emit("%s" % _("GRBL paused."))
 
     def probing_gcode(self, storage):
@@ -2094,8 +2133,9 @@ class ToolLevelling(CNCjob, AppTool):
 
                 cmd = 'G0 Z%s' % pr_travelz
                 self.send_grbl_command(command=cmd)
-                cmd = 'M2'
-                self.send_grbl_command(command=cmd)
+                # no program end here: GRBL resets every modal state to its default when a program ends, which
+                # among other things selects G54 again and stops the spindle, and the probing is only a step
+                # before the job itself is sent over the same connection
                 self.app.inform.emit('%s' % _("Finished probing. Doing the autolevelling."))
 
                 self.store_probed_points(probed_points)
@@ -2152,9 +2192,12 @@ class ToolLevelling(CNCjob, AppTool):
     def on_grbl_apply_autolevel(self):
         self.autolevell_gcode()
 
-    def on_grbl_send_job(self):
+    def on_grbl_send_job(self, start_line=1):
         """
-        Send the GCode of the selected CNCJob object to the GRBL controller, one line at a time.
+        Send the GCode of the selected CNCJob object to the GRBL controller.
+
+        :param start_line:  the number of the first line to send
+        :type start_line:   int
         """
         target_obj = self.app.collection.get_by_name(self.ui.object_combo.get_value())
         if target_obj is None:
@@ -2178,55 +2221,371 @@ class ToolLevelling(CNCjob, AppTool):
         self.app.ui.shell_dock.show()
 
         self.grbl_job_stop = False
+        self.grbl_job_waiting = False
         self.ui.grbl_send_job_button.setDisabled(True)
         self.ui.grbl_stop_job_button.setDisabled(False)
+        self.ui.grbl_continue_button.setDisabled(True)
+        self.ui.grbl_resume_job_button.setDisabled(True)
 
         def worker_task():
             with self.app.proc_container.new('%s...' % _("Sending")):
-                self.grbl_stream_gcode(job_gcode)
+                self.grbl_stream_gcode(job_gcode, start_line=start_line)
 
         self.app.worker_task.emit({'fcn': worker_task, 'params': []})
+
+    def on_grbl_resume_job(self):
+        """
+        Send the job again, starting with the line the user chose.
+        """
+        self.on_grbl_send_job(start_line=self.ui.grbl_resume_line_entry.get_value())
 
     def on_grbl_job_progress(self, text):
         self.ui.grbl_job_progress_label.set_value(text)
 
+    def on_grbl_job_paused(self, message):
+        """
+        Tell the operator what the machine waits for at a program pause.
+        """
+        self.ui.grbl_continue_button.setDisabled(False)
+        self.ui.grbl_job_progress_label.set_value(message)
+        self.app.inform.emit('[WARNING_NOTCL] %s' % message)
+
+    def on_grbl_continue_job(self):
+        """
+        Let a job that stopped at a program pause continue.
+        """
+        if self.grbl_job_waiting is False:
+            return
+
+        try:
+            # cycle start; it releases the hold that the program pause put the controller in
+            self.grbl_ser_port.write('~'.encode('utf-8'))
+        except Exception as e:
+            self.app.log.error("ToolLevelling.on_grbl_continue_job() --> %s" % str(e))
+
+        self.ui.grbl_continue_button.setDisabled(True)
+        self.grbl_job_waiting = False
+        self.app.inform.emit('%s' % _("The job continues."))
+
     def on_grbl_job_finished(self):
         self.ui.grbl_send_job_button.setDisabled(False)
         self.ui.grbl_stop_job_button.setDisabled(True)
+        self.ui.grbl_continue_button.setDisabled(True)
+
+        # a job that did not run to its end can be resumed from the line that follows the last one the
+        # controller acknowledged
+        resume_from = self.grbl_job_last_ack + 1
+        can_resume = 1 < resume_from <= len(self.grbl_job_lines)
+        self.ui.grbl_resume_job_button.setDisabled(not can_resume)
+        if can_resume:
+            self.ui.grbl_resume_line_entry.set_value(resume_from)
 
     def on_grbl_stop_job(self):
         """
         Hold the machine and stop sending the job.
         """
         self.grbl_job_stop = True
+        self.grbl_job_waiting = False
         try:
-            # feed hold; the job is not resumed, the remaining lines are not sent
-            self.send_grbl_command(command='!', echo=False)
+            # feed hold; the job is not resumed, the remaining lines are not sent. It is a realtime command that
+            # the controller does not acknowledge and reading the port here would take the answers that the
+            # thread which streams the job waits for.
+            self.grbl_ser_port.write('!'.encode('utf-8'))
         except Exception as e:
             self.app.log.error("ToolLevelling.on_grbl_stop_job() --> %s" % str(e))
         self.app.inform.emit('[WARNING_NOTCL] %s' % _("Sending the job was stopped."))
 
-    def grbl_stream_gcode(self, job_gcode):
+    @staticmethod
+    def grbl_extract_message(gcode_line):
         """
-        Send a GCode program to the GRBL controller waiting for each line to be acknowledged before sending the
-        next one.
+        The text that a (MSG, ...) comment addresses to the operator.
+
+        :param gcode_line:  a line of GCode
+        :type gcode_line:   str
+        :return:            the text of the message or None when the line holds no message
+        :rtype:             str or None
+        """
+        found = ToolLevelling.msg_re.search(gcode_line)
+        return found.group(1) if found else None
+
+    @staticmethod
+    def grbl_prepare_job(job_gcode):
+        """
+        Turn a GCode program into the lines that are to be sent to a GRBL controller.
+
+        Comments are not sent because GRBL has no use for them, but the text of a (MSG, ...) comment is kept and
+        attached to the line that follows it so that it can be shown to the operator. The M6 word is taken out
+        because GRBL does not support it and would reject the whole line it is on.
 
         :param job_gcode:   the GCode program
         :type job_gcode:    str
+        :return:            a (line, message, pauses the machine) tuple for every line that is to be sent
+        :rtype:             list
         """
-        lines = []
-        for line in job_gcode.splitlines():
-            stripped_line = line.strip()
-            # GRBL has no use for empty lines or for comments
-            if not stripped_line or stripped_line.startswith('(') or stripped_line.startswith(';'):
-                continue
-            lines.append(stripped_line)
+        prepared = []
+        pending_message = None
 
-        total = len(lines)
-        self.app.inform.emit('%s: %d' % (_("Sending the job to the GRBL controller. Lines"), total))
+        for raw_line in job_gcode.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            message = ToolLevelling.grbl_extract_message(line)
+            if message:
+                pending_message = message
+
+            line = ToolLevelling.comment_re.sub(' ', line).split(';')[0]
+            line = ToolLevelling.m6_re.sub(' ', line)
+            line = ' '.join(line.split())
+            if not line:
+                continue
+
+            prepared.append((line, pending_message, bool(ToolLevelling.pause_re.search(line))))
+            pending_message = None
+
+        return prepared
+
+    @staticmethod
+    def grbl_resume_preamble(sent_lines):
+        """
+        The commands that restore the state of the controller before a job is resumed from somewhere in the
+        middle of it. The lines that are skipped carry that state and are scanned for it.
+
+        The tool is lifted to the highest Z the skipped lines used, which is the travel or tool change height,
+        so that the first move of the resumed job does not drag the tool through the material.
+
+        :param sent_lines:  the lines of the job that are skipped, as they come out of grbl_prepare_job()
+        :type sent_lines:   list
+        :return:            the commands to send before the job continues
+        :rtype:             list
+        """
+        preamble = []
+        upper_lines = [line.upper() for line in sent_lines]
+
+        # a modal command stays in effect until another one of its group replaces it
+        for group in ToolLevelling.modal_groups:
+            for line in reversed(upper_lines):
+                in_line = next((code for code in group if re.search(r"\b%s\b" % code, line)), None)
+                if in_line:
+                    preamble.append(in_line)
+                    break
+
+        for line in reversed(upper_lines):
+            found = ToolLevelling.feed_re.search(line)
+            if found:
+                preamble.append('F%s' % found.group(1))
+                break
+
+        # the spindle is only started again when it was not stopped by the last command that addressed it
+        spindle_dir = None
+        for line in reversed(upper_lines):
+            found = ToolLevelling.spindle_re.search(line)
+            if found:
+                spindle_dir = found.group(1)
+                break
+
+        if spindle_dir in ('3', '4'):
+            speed = None
+            for line in reversed(upper_lines):
+                found = ToolLevelling.speed_re.search(line)
+                if found:
+                    speed = found.group(1)
+                    break
+            preamble.append('M0%s S%s' % (spindle_dir, speed) if speed else 'M0%s' % spindle_dir)
+
+        heights = [float(value) for line in upper_lines
+                   for axis, value in ToolLevelling.coord_re.findall(line) if axis == 'Z']
+        if heights:
+            preamble.append('G00 Z%s' % max(heights))
+
+        return preamble
+
+    def grbl_next_response(self, pending, timeout):
+        """
+        The next answer line of the controller.
+
+        The answers are buffered because the controller may answer several of the streamed lines at once and
+        none of those answers may be lost. An answer that was read before all of it arrived is kept until the
+        rest of it does.
+
+        :param pending: buffers the answers that were read from the port but not consumed yet
+        :type pending:  list
+        :param timeout: for how long to wait for an answer, in seconds
+        :type timeout:  float
+        :return:        the answer or None when the controller did not answer in time
+        :rtype:         str or None
+        """
+        deadline = time.monotonic() + timeout
+
+        while True:
+            while pending:
+                response = pending.pop(0).strip()
+                if response:
+                    return response
+
+            if self.grbl_job_stop is True or time.monotonic() >= deadline:
+                return None
+
+            raw = self.grbl_ser_port.readlines()
+            if raw:
+                raw[0] = self.grbl_rx_partial + raw[0]
+                self.grbl_rx_partial = b''
+                if not raw[-1].endswith(b'\n'):
+                    self.grbl_rx_partial = raw.pop()
+                pending.extend(self.grbl_decode(raw))
+
+            if not pending:
+                time.sleep(0.01)
+
+    def grbl_collect_ack(self, pending, in_flight):
+        """
+        Wait for the controller to answer and account for the oldest line that it did not acknowledge yet.
+
+        Everything that is not an acknowledgement, a push message of the controller for instance, is shown in
+        the shell and does not count as the answer to a line.
+
+        :param pending:     buffers the answers that were read from the port but not consumed yet
+        :type pending:      list
+        :param in_flight:   the lines that were sent but not acknowledged yet, as (line number, bytes) pairs
+        :type in_flight:    list
+        :return:            True when a line was acknowledged
+        :rtype:             bool
+        """
+        while True:
+            if self.grbl_job_stop is True:
+                return False
+
+            response = self.grbl_next_response(pending, timeout=self.grbl_job_line_timeout)
+            if response is None:
+                self.app.inform.emit(
+                    '[ERROR_NOTCL] %s %d' % (_("The GRBL controller did not answer for line"),
+                                             in_flight[0][0] if in_flight else 0)
+                )
+                return False
+
+            low_response = response.lower()
+
+            if low_response.startswith('ok'):
+                if in_flight:
+                    self.grbl_job_last_ack = in_flight.pop(0)[0]
+                return True
+
+            if low_response.startswith('error') or low_response.startswith('alarm'):
+                line_nr = in_flight.pop(0)[0] if in_flight else 0
+                offender = self.grbl_job_lines[line_nr - 1][0] if 0 < line_nr <= len(self.grbl_job_lines) else ''
+                self.app.inform_shell.emit('\t\t\t: %s' % response.upper())
+                self.app.inform.emit(
+                    '[ERROR_NOTCL] %s %d: %s' % (_("The GRBL controller rejected the line"), line_nr, offender)
+                )
+                return False
+
+            # the controller has something to say that is not about the line that was sent
+            self.app.inform_shell.emit('\t\t\t: %s' % response.upper())
+
+    def grbl_wait_for_hold(self, timeout=120.0):
+        """
+        Poll the controller until it reports that it holds, which is what it does once it worked through
+        everything that was sent to it and executed the program pause. Nothing may be waiting for an
+        acknowledgement when this is called because the status reports are read from the same port.
+
+        :param timeout: for how long to wait for the machine to come to a stop, in seconds
+        :type timeout:  float
+        :return:        True when the controller reported that it holds
+        :rtype:         bool
+        """
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            if self.grbl_job_stop is True:
+                return False
+
+            # a status report is asked for; it is a realtime command that is not acknowledged with 'ok'
+            self.grbl_ser_port.write('?'.encode('utf-8'))
+            time.sleep(0.2)
+
+            for response in self.grbl_decode(self.grbl_ser_port.readlines()):
+                low_response = response.lower()
+                if low_response.startswith('<') and ('hold' in low_response or 'door' in low_response):
+                    return True
+
+        return False
+
+    def grbl_wait_for_operator(self, message=None):
+        """
+        Stop streaming until the operator acted on a program pause, a tool change for instance, and pressed the
+        Continue button.
+
+        :param message: what the preprocessor asks the operator to do
+        :type message:  str or None
+        :return:        True when the job may continue
+        :rtype:         bool
+        """
+        self.grbl_wait_for_hold()
+
+        if self.grbl_job_stop is True:
+            return False
+
+        self.grbl_job_waiting = True
+        self.grbl_job_paused_sig.emit(
+            message if message else _("The job is paused. Press Continue when the machine is ready."))
+
+        while self.grbl_job_waiting is True and self.grbl_job_stop is False:
+            time.sleep(0.2)
+
+        self.grbl_job_waiting = False
+        return self.grbl_job_stop is False
+
+    def grbl_stream_gcode(self, job_gcode, start_line=1):
+        """
+        Send a GCode program to the GRBL controller.
+
+        The lines are streamed with the character counting protocol: as many of them are sent as fit in the
+        receive buffer of the controller, so that its planner is kept full and a job that is made of many short
+        segments is not slowed down by the round trip of every single line. A program pause stops the streaming
+        until the operator acted on it.
+
+        :param job_gcode:   the GCode program
+        :type job_gcode:    str
+        :param start_line:  the number of the first line to send; the lines before it are only scanned for the
+                            state that has to be restored before the job continues
+        :type start_line:   int
+        """
+        prepared = self.grbl_prepare_job(job_gcode)
+        self.grbl_job_lines = prepared
+        self.grbl_job_last_ack = start_line - 1
+        self.grbl_rx_partial = b''
+
+        total = len(prepared)
+        if start_line > total:
+            self.app.inform.emit('[ERROR_NOTCL] %s: %d' % (_("The job has no line"), start_line))
+            self.grbl_job_finished_sig.emit()
+            return
+
+        # whatever is left in the port from an earlier command would be taken for an acknowledgement
+        self.grbl_ser_port.reset_input_buffer()
+
+        # the answers that were read from the port but not consumed yet
+        pending = []
+        # the lines that were sent but not acknowledged yet, as (line number, length in bytes) pairs
+        in_flight = []
 
         try:
-            for idx, line in enumerate(lines, 1):
+            if start_line > 1:
+                self.app.inform.emit('%s: %d' % (_("Resuming the job from line"), start_line))
+                for command in self.grbl_resume_preamble([line for line, _msg, _p in prepared[:start_line - 1]]):
+                    if self.grbl_job_stop is True:
+                        return
+                    if not self.send_grbl_command(command=command, timeout=self.grbl_job_line_timeout):
+                        self.app.inform.emit(
+                            '[ERROR_NOTCL] %s: %s' % (_("The GRBL controller rejected the line"), command))
+                        return
+            else:
+                self.app.inform.emit('%s: %d' % (_("Sending the job to the GRBL controller. Lines"), total))
+
+            for idx, (line, message, pauses) in enumerate(prepared, 1):
+                if idx < start_line:
+                    continue
+
                 if self.grbl_job_stop is True:
                     return
 
@@ -2237,19 +2596,48 @@ class ToolLevelling(CNCjob, AppTool):
                 if self.grbl_job_stop is True:
                     return
 
-                self.grbl_ser_port.write((line + '\n').encode('utf-8'))
-                answer, acknowledged = self.grbl_read_reply(timeout=self.grbl_job_line_timeout)
+                if message:
+                    # what the preprocessor has to say to the operator
+                    self.app.inform_shell.emit('%s: %s' % (_("Message"), message))
+                    self.grbl_job_progress_sig.emit(message)
+
+                if line.startswith('$'):
+                    # a system command answers with more than an acknowledgement and it is not queued by the
+                    # controller, therefore it is sent on its own and its whole answer is read
+                    while in_flight:
+                        if self.grbl_collect_ack(pending, in_flight) is False:
+                            return
+                    if not self.send_grbl_command(command=line, timeout=self.grbl_job_line_timeout):
+                        self.app.inform.emit(
+                            '[ERROR_NOTCL] %s %d: %s' % (_("The GRBL controller rejected the line"), idx, line))
+                        return
+                    self.grbl_job_last_ack = idx
+                else:
+                    sent_bytes = len(line) + 1
+                    # only as many lines are sent as the receive buffer of the controller can still hold
+                    while in_flight and sum(count for _nr, count in in_flight) + sent_bytes > self.grbl_rx_buffer:
+                        if self.grbl_collect_ack(pending, in_flight) is False:
+                            return
+
+                    self.grbl_ser_port.write((line + '\n').encode('utf-8'))
+                    in_flight.append((idx, sent_bytes))
 
                 # a job has many lines therefore the progress is not reported for every one of them
                 if idx == total or idx % 25 == 0:
                     self.grbl_job_progress_sig.emit('%s: %d / %d' % (_("Line"), idx, total))
 
-                if not acknowledged:
-                    for answer_line in answer:
-                        self.app.inform_shell.emit('\t\t\t: ' + answer_line.upper())
-                    self.app.inform.emit(
-                        '[ERROR_NOTCL] %s %d: %s' % (_("The GRBL controller rejected the line"), idx, line)
-                    )
+                if pauses:
+                    # the machine only reaches the pause once it worked through everything that was sent
+                    while in_flight:
+                        if self.grbl_collect_ack(pending, in_flight) is False:
+                            return
+
+                    if self.grbl_wait_for_operator(message) is False:
+                        return
+
+            # the job is only done once the controller acknowledged the last line of it
+            while in_flight:
+                if self.grbl_collect_ack(pending, in_flight) is False:
                     return
 
             self.app.inform.emit('[success] %s' % _("The job was sent to the GRBL controller."))
@@ -2888,7 +3276,8 @@ class LevelUI:
         self.grbl_send_job_button = FCButton(_("Send Job"))
         self.grbl_send_job_button.setToolTip(
             _("Will send the GCode of the selected CNCJob object\n"
-              "to the GRBL controller, line by line.")
+              "to the GRBL controller. A tool change stops the job\n"
+              "until it is continued.")
         )
         grbl_send_grid.addWidget(self.grbl_send_job_button, 11, 0)
 
@@ -2900,8 +3289,38 @@ class LevelUI:
         self.grbl_stop_job_button.setDisabled(True)
         grbl_send_grid.addWidget(self.grbl_stop_job_button, 11, 1)
 
+        # CONTINUE A PAUSED JOB
+        self.grbl_continue_button = FCButton(_("Continue"))
+        self.grbl_continue_button.setToolTip(
+            _("Will let a job that stopped at a program pause continue.\n"
+              "A tool change stops the job until the tool was changed\n"
+              "and its length was set.")
+        )
+        self.grbl_continue_button.setDisabled(True)
+        grbl_send_grid.addWidget(self.grbl_continue_button, 12, 0, 1, 2)
+
+        # RESUME A STOPPED JOB
+        self.grbl_resume_job_button = FCButton(_("Resume from line"))
+        self.grbl_resume_job_button.setToolTip(
+            _("Will send the job again, starting with the line on the right.\n"
+              "The units, the distance mode, the feedrate and the spindle of\n"
+              "the skipped lines are restored first and the tool is lifted to\n"
+              "a safe height before the first move.")
+        )
+        self.grbl_resume_job_button.setDisabled(True)
+        grbl_send_grid.addWidget(self.grbl_resume_job_button, 13, 0)
+
+        self.grbl_resume_line_entry = FCSpinner()
+        self.grbl_resume_line_entry.set_range(1, 9999999)
+        self.grbl_resume_line_entry.setToolTip(
+            _("The number of the line to resume the job from.\n"
+              "Only the lines that are sent to the controller are counted,\n"
+              "the comments and the empty lines are not.")
+        )
+        grbl_send_grid.addWidget(self.grbl_resume_line_entry, 13, 1)
+
         self.grbl_job_progress_label = FCLabel('')
-        grbl_send_grid.addWidget(self.grbl_job_progress_label, 12, 0, 1, 2)
+        grbl_send_grid.addWidget(self.grbl_job_progress_label, 14, 0, 1, 2)
 
         hm_lay = QtWidgets.QHBoxLayout()
         # GET HEIGHT MAP
@@ -2920,7 +3339,7 @@ class LevelUI:
         )
         hm_lay.addWidget(self.grbl_save_height_map_button, stretch=0, alignment=Qt.AlignmentFlag.AlignRight)
 
-        grbl_send_grid.addLayout(hm_lay, 14, 0, 1, 2)
+        grbl_send_grid.addLayout(hm_lay, 15, 0, 1, 2)
 
         self.grbl_frame.hide()
         # #############################################################################################################

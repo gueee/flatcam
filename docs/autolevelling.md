@@ -190,16 +190,88 @@ Export the G-code as usual and cut it with whatever sender you prefer. The expor
 levelled one.
 
 Or send it straight from FlatCAM over the GRBL connection you already have open: on the **Sender**
-tab press **Send Job**. Lines go out one at a time, each waiting for the controller to acknowledge
-it, and a counter shows the progress as `Line N / total`.
+tab press **Send Job**. A counter shows the progress as `Line N / total`.
 
-- **Pause/Resume** on the Control tab holds and releases the machine mid-job.
-- **Stop** holds the machine and stops sending. It does not resume; the remaining lines are
-  discarded.
-- If the controller reports an `error:` or an `ALARM:`, the stream stops and the message appears in
-  the shell.
+Lines are streamed with GRBL's character counting protocol: FlatCAM keeps the controller's 128 byte
+receive buffer filled instead of waiting for each line to be acknowledged before sending the next
+one. This matters for levelled jobs, which are made of thousands of very short segments. Waiting for
+a round trip per segment empties the controller's motion planner between moves, and the machine
+stutters and dwells at every segment border.
 
-Long moves can take a while to acknowledge, which is normal and not treated as a lost connection.
+Comments are not sent, since GRBL has no use for them, with one exception: the text of a
+`(MSG, ...)` comment is printed in the shell and in the progress label, because that is how a
+preprocessor talks to the operator.
+
+| Control | What it does |
+|---|---|
+| **Pause/Resume** (Control tab) | Holds and releases the machine mid-job. |
+| **Stop** | Holds the machine and stops sending. The remaining lines are not sent. |
+| **Continue** | Lets a job that stopped at a program pause, a tool change for instance, carry on. |
+| **Resume from line** | Sends the job again starting at the given line, restoring the state first. |
+
+If the controller reports an `error:` or an `ALARM:`, the stream stops and the message appears in the
+shell together with the line that caused it. Long moves can take a while to acknowledge, which is
+normal and not treated as a lost connection.
+
+Your work origin is safe throughout. FlatCAM never sends a homing cycle (`$H`) and never changes the
+work coordinate system on its own, so nothing is lost between probing, cutting and a second job. It
+also does not send a program end (`M2`) after probing, because GRBL resets every modal state to its
+default when a program ends, which would reselect `G54` and stop the spindle in the middle of your
+session.
+
+### Tool changes and tool length
+
+GRBL does not implement `M6`. A line that holds it is answered with `error:20` and, in a plain
+sender, the job dies there. FlatCAM removes the `M6` word before sending and keeps the rest of the
+line, so the `T` number still goes out.
+
+What actually stops the machine is the `M0` that the preprocessors emit right after the tool change
+message. When the sender reaches an `M0` it waits for the controller to report that it holds, shows
+you the preprocessor's message, and enables **Continue**. The machine stays exactly where it is.
+Change the tool, then press **Continue**, which sends a cycle start.
+
+Which tool to mount is in the message itself: `Change to Tool Dia = 0.8`, and for drilling also the
+number of holes that tool will make.
+
+Setting the length of the new tool is the part that has to be right, because a tool that sits 2 mm
+deeper than the previous one cuts 2 mm deeper. Three preprocessors handle it, and all three work on
+GRBL:
+
+| Preprocessor | How the tool length is set |
+|---|---|
+| `Toolchange_Probe_GRBL` | Probes the surface with `G38.2` and zeroes Z on it. |
+| `Toolchange_Manual` | You lower the tool onto the material by hand and tighten it there. |
+| `GRBL_11_no_M6` | Not at all; the tool has to go back to the same length as before. |
+
+`Toolchange_Probe_GRBL` is the one to pick if your machine has a probe input. At every tool change it
+stops for the tool and the probe clip, then touches the surface twice, the second time at half the
+feed rate for accuracy, and makes that point Z zero with `G92 Z0`. Then it lifts clear and stops once
+more so you can take the clip off. Its probe depth and probe feed rate come from the Milling
+plugin's **Z Probe depth** and **Feedrate Probe**; keep the feed rate low, 80 mm/min or less.
+
+`G92` is used rather than a `G43.1` tool length offset because the rest of the program, and the
+height map from the levelling step, are written against the work coordinate system. Both are volatile
+in GRBL: a soft reset, an alarm or a power cycle drops them, and the tool length has to be probed
+again. That is what the two probing stops at every tool change are for.
+
+### Resuming a job
+
+A job that stopped, because you pressed **Stop**, because of an alarm, or because the controller
+rejected a line, can be picked up again. FlatCAM counts the lines it sent, so after the job ends
+**Resume from line** is enabled and the box beside it holds the line after the last one the
+controller acknowledged. That number counts only the lines that were actually sent: comments and
+empty lines are not counted, which is also how the `Line N / total` counter reads.
+
+Before the first line goes out, FlatCAM replays the state that the skipped lines had set: the units,
+the distance and feed rate modes, the plane, the work coordinate system, the last feed rate, and the
+spindle with its speed unless the last spindle command was a stop. Then it lifts the tool to the
+highest Z the skipped part of the job used, which is your travel or tool change height, so the first
+move cannot drag the tool through the material.
+
+Two things it cannot do for you. If the resume line is itself a plunge or a cut, the tool goes
+straight back down to depth at that point, so pick a line at the start of a path rather than in the
+middle of one. And if the controller was reset or powered down in between, the `G92` tool length and
+your work zero are gone and have to be set again before resuming means anything.
 
 ## Troubleshooting
 
@@ -217,6 +289,18 @@ uncorrected program.
 
 **Connect stays red.** No answer from the controller. Wrong port or baud rate, or another program
 has the port.
+
+**`error:20` from the controller.** An unsupported command. FlatCAM strips `M6` before sending, but
+a file you exported and ran in another sender still holds it; use the `GRBL_11_no_M6` or
+`Toolchange_Probe_GRBL` preprocessor for those.
+
+**`ALARM:4` or `ALARM:5` after a tool change.** The probe. `ALARM:5` means the probe never touched
+anything within the probe depth, `ALARM:4` means it was already triggered when the move started.
+Check the clip and that the probe depth reaches past the surface. The controller is in an alarm state
+afterwards: unlock it with `$X` from the Control tab, set the tool length again, then resume.
+
+**The job stopped and the machine is holding.** That is a program pause waiting for you. Read the
+message in the shell or the progress label, do what it asks, then press **Continue**.
 
 **Depth is right in the middle and wrong at the edges.** Your probe points do not reach far enough
 out. Add rows and columns, or place manual points nearer the corners. Outside the probed area the

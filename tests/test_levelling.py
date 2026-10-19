@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """
-Tests for the autolevelling height interpolation and for the GCode Z compensation.
+Tests for the autolevelling height interpolation, for the GCode Z compensation and for the helpers of the GRBL
+sender.
 
 Run: python tests/test_levelling.py
 """
@@ -255,6 +256,81 @@ class TestStoreProbedPoints(unittest.TestCase):
         self.assertAlmostEqual(tool.al_voronoi_geo_storage[1]['point'].x, 1.0)
         self.assertAlmostEqual(tool.al_voronoi_geo_storage[1]['height'], 0.3)
         self.assertIsNone(tool.al_voronoi_geo_storage[1]['geo'])
+
+
+class TestGrblPrepareJob(unittest.TestCase):
+    """What of a GCode program is sent to a GRBL controller and what is not."""
+
+    def test_empty_lines_and_comments_are_not_sent(self):
+        gcode = "G21\n\n(a plain comment)\n; another one\nG90\n"
+        self.assertEqual([line for line, _m, _p in ToolLevelling.grbl_prepare_job(gcode)], ['G21', 'G90'])
+
+    def test_inline_comment_is_taken_out_of_the_line(self):
+        prepared = ToolLevelling.grbl_prepare_job("G00 X1.0 Y2.0 (rapid) ; trailing\n")
+        self.assertEqual(prepared[0][0], 'G00 X1.0 Y2.0')
+
+    def test_message_is_attached_to_the_line_that_follows_it(self):
+        gcode = "T1\n(MSG, Change to Tool Dia = 0.8)\nM0\nG00 Z2.0\n"
+        prepared = ToolLevelling.grbl_prepare_job(gcode)
+
+        self.assertEqual([line for line, _m, _p in prepared], ['T1', 'M0', 'G00 Z2.0'])
+        self.assertEqual(prepared[1][1], 'Change to Tool Dia = 0.8')
+        # the message belongs to one line only
+        self.assertIsNone(prepared[0][1])
+        self.assertIsNone(prepared[2][1])
+
+    def test_message_on_the_same_line_as_a_command(self):
+        prepared = ToolLevelling.grbl_prepare_job("M0 (MSG, Mount the probe)\n")
+        self.assertEqual(prepared[0][0], 'M0')
+        self.assertEqual(prepared[0][1], 'Mount the probe')
+
+    def test_m6_is_taken_out_but_the_rest_of_the_line_is_kept(self):
+        prepared = ToolLevelling.grbl_prepare_job("T1\nM6\nT2 M06\n")
+        self.assertEqual([line for line, _m, _p in prepared], ['T1', 'T2'])
+
+    def test_a_pause_is_recognized(self):
+        prepared = ToolLevelling.grbl_prepare_job("M0\nM01\nM5\nM30\nM09\nG01 X1.0\n")
+        self.assertEqual([(line, pauses) for line, _m, pauses in prepared],
+                         [('M0', True), ('M01', True), ('M5', False), ('M30', False),
+                          ('M09', False), ('G01 X1.0', False)])
+
+
+class TestGrblResumePreamble(unittest.TestCase):
+    """The state that is restored before a stopped job is resumed."""
+
+    def test_the_last_command_of_every_modal_group_is_restored(self):
+        sent = ['G20', 'G21', 'G91', 'G90', 'G93', 'G94', 'G17', 'G55', 'G54']
+        self.assertEqual(ToolLevelling.grbl_resume_preamble(sent), ['G21', 'G90', 'G94', 'G17', 'G54'])
+
+    def test_feedrate_spindle_and_lift(self):
+        sent = ['G21', 'G90', 'M03 S12000', 'G00 Z2.0000', 'G01 Z-0.0500 F120.0', 'G01 X5.0000 Y0.0000']
+        self.assertEqual(ToolLevelling.grbl_resume_preamble(sent),
+                         ['G21', 'G90', 'F120.0', 'M03 S12000', 'G00 Z2.0'])
+
+    def test_a_stopped_spindle_is_not_started_again(self):
+        sent = ['G21', 'M03 S12000', 'G01 Z-0.05 F120.0', 'M05', 'G00 Z15.0']
+        self.assertEqual(ToolLevelling.grbl_resume_preamble(sent), ['G21', 'F120.0', 'G00 Z15.0'])
+
+    def test_the_lift_goes_to_the_highest_z_of_the_skipped_lines(self):
+        sent = ['G00 Z2.0', 'G01 Z-0.05', 'G00 Z15.0', 'G01 Z-0.1']
+        self.assertIn('G00 Z15.0', ToolLevelling.grbl_resume_preamble(sent))
+
+    def test_nothing_to_restore(self):
+        self.assertEqual(ToolLevelling.grbl_resume_preamble([]), [])
+
+    def test_a_job_that_only_moves_in_xy_gets_no_lift(self):
+        self.assertEqual(ToolLevelling.grbl_resume_preamble(['G21', 'G00 X1.0 Y2.0']), ['G21'])
+
+
+class TestGrblExtractMessage(unittest.TestCase):
+    def test_a_message_is_found(self):
+        self.assertEqual(ToolLevelling.grbl_extract_message('(MSG, Change the tool)'), 'Change the tool')
+
+    def test_the_comma_and_the_spacing_are_optional(self):
+        self.assertEqual(ToolLevelling.grbl_extract_message('( msg Change the tool )'), 'Change the tool')
+
+    def test_a_plain_comment_holds_no_message(self):
+        self.assertIsNone(ToolLevelling.grbl_extract_message('(TOOL DIAMETER: 0.8mm)'))
 
 
 if __name__ == '__main__':
