@@ -1757,7 +1757,7 @@ class ToolLevelling(CNCjob, AppTool):
             return
         cmd = ''
 
-        step = self.ui.jog_step_entry.get_value(),
+        step = self.ui.jog_step_entry.get_value()
         feedrate = self.ui.jog_fr_entry.get_value()
         travelz = float(self.app.options["tools_al_grbl_travelz"])
 
@@ -1777,12 +1777,38 @@ class ToolLevelling(CNCjob, AppTool):
 
         if direction == 'origin':
             cmd = "$J=G90 %s Z%s F%s" % ({'IN': 'G20', 'MM': 'G21'}[self.units], str(travelz), str(feedrate))
-            self.send_grbl_command(command=cmd, echo=False)
+            if self.grbl_send_jog(cmd) is False:
+                return
             cmd = "$J=G90 %s X0.0 Y0.0 F%s" % ({'IN': 'G20', 'MM': 'G21'}[self.units], str(feedrate))
-            self.send_grbl_command(command=cmd, echo=False)
+            self.grbl_send_jog(cmd)
             return
 
-        self.send_grbl_command(command=cmd, echo=False)
+        self.grbl_send_jog(cmd)
+
+    def grbl_send_jog(self, command):
+        """
+        Send a jog command and say so when the controller refused it. A jog that is out of the machine travel
+        or one that is sent while the controller holds is answered with an error and the machine does not move,
+        which without this looks like a button that does nothing.
+
+        :param command: the jog command
+        :type command:  str
+        :return:        True when the controller accepted the jog
+        :rtype:         bool
+        """
+        if self.grbl_ser_port is None or not self.grbl_ser_port.is_open:
+            self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller is not connected."))
+            return False
+
+        if self.send_grbl_command(command=command, echo=False):
+            return True
+
+        # the state says why: an alarm has to be cleared with $X, a hold with the Pause/Resume button, and a
+        # jog that is refused while the machine is idle was out of the travel the soft limits allow
+        state = self.grbl_read_status()
+        self.app.inform.emit('[ERROR_NOTCL] %s: %s (%s: %s)' % (
+            _("The GRBL controller rejected the jog"), command, _("state"), state if state else _("unknown")))
+        return False
 
     @staticmethod
     def grbl_zero_command(axis):
