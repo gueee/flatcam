@@ -1512,6 +1512,8 @@ class ToolLevelling(CNCjob, AppTool):
             self.ui.al_rows_entry.setMinimum(1)
 
     def on_controller_change(self):
+        # kept in the options, which are saved when the application closes, so the choice survives a restart
+        self.app.options["tools_al_controller"] = self.ui.al_controller_combo.get_value()
         self.on_controller_change_alter_ui()
 
         # if the is empty then there is a chance that we've added probe points but the GRBL controller was selected
