@@ -52,6 +52,8 @@ class FakeGrbl:
         self.mute = False
         # when set, a move past machine 0 runs into the limit switch the machine homes against
         self.hard_limits = False
+        # when set, the homing cycle does not find the switches, the motors have no power for instance
+        self.switches_missing = False
         # after a limit was hit the controller takes nothing but a reset and status queries
         self.critical = False
 
@@ -219,6 +221,10 @@ class FakeGrbl:
         if upper == '$H':
             if self.settings[22] == '0':
                 self._emit('error:5')
+                return
+            if self.switches_missing:
+                self.state = 'Alarm'
+                self._emit('ALARM:9')
                 return
             # every axis homes in the positive direction and is pulled off the switch by $27
             self.mpos = [-float(self.settings[27])] * 3
@@ -421,6 +427,7 @@ def make_sender(port):
     tool.grbl_port_readers = 0
     tool.grbl_port_readers_lock = threading.Lock()
     tool.grbl_status_time = 0.0
+    tool.grbl_last_answer = []
     tool.grbl_status_timer = SimpleNamespace(start=lambda: None, stop=lambda: None)
     tool.ui.grbl_wpos_labels = [FakeWidget() for _i in range(3)]
     tool.ui.grbl_mpos_labels = [FakeWidget() for _i in range(3)]
@@ -530,6 +537,21 @@ class TestAutolevelHeights(unittest.TestCase):
 
     def test_inch(self):
         self.assertAlmostEqual(ToolLevelling.grbl_work_height(-35.254, -35.0, 'IN'), -0.01)
+
+    def test_a_probe_point_without_coordinates_is_dropped(self):
+        from shapely import Point
+        self.sender.ui.al_method_radio.set_value('v')
+        self.sender.al_voronoi_geo_storage = {
+            1: {'point': Point(0.0, 0.0), 'geo': None, 'height': 0.0},
+            2: {'point': Point(), 'geo': None, 'height': 0.0},
+            3: {'point': Point(5.0, 5.0), 'geo': None, 'height': 0.0},
+        }
+        self.assertEqual(self.sender.probe_points(), [(0.0, 0.0), (5.0, 5.0)])
+        # the heights are stored by number, in the order of the points
+        self.sender.store_probed_points([(0.0, 0.0, -0.01), (5.0, 5.0, -0.02)])
+        storage = self.sender.al_voronoi_geo_storage
+        self.assertEqual(sorted(storage), [1, 2])
+        self.assertEqual((storage[2]['point'].x, storage[2]['height']), (5.0, -0.02))
 
     def test_the_work_offset_is_read_fresh(self):
         self.sender.grbl_status['wco'] = [0.0, 0.0, 0.0]
@@ -765,6 +787,12 @@ class TestManualControl(unittest.TestCase):
         self.grbl.settings[22] = '0'
         self.assertFalse(self.sender.grbl_homing())
         self.assertIn('$22=0', self.sender.app.inform.text())
+
+    def test_homing_that_does_not_find_the_switches(self):
+        self.grbl.switches_missing = True
+        self.assertFalse(self.sender.grbl_homing())
+        self.assertIn('not found within the search distance', self.sender.app.inform.text())
+        self.assertNotIn('$22=0', self.sender.app.inform.text())
 
 
 class TestProbeZ(unittest.TestCase):

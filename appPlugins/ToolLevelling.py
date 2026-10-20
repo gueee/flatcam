@@ -198,6 +198,8 @@ class ToolLevelling(CNCjob, AppTool):
         self.grbl_port_readers_lock = threading.Lock()
         # when the last status report came in, to show that the position display is not current
         self.grbl_status_time = 0.0
+        # the lines of the last answer to send_grbl_command, also when the command was refused
+        self.grbl_last_answer = []
 
         # asks the controller for its status, for the position display
         self.grbl_status_timer = QtCore.QTimer()
@@ -590,6 +592,7 @@ class ToolLevelling(CNCjob, AppTool):
     def build_al_table(self):
         tool_idx = 0
 
+        self.al_drop_empty_points()
         n = len(self.al_voronoi_geo_storage)
         self.ui.al_probe_points_table.setRowCount(n)
 
@@ -598,14 +601,10 @@ class ToolLevelling(CNCjob, AppTool):
             row_no = tool_idx - 1
 
             t_id = QtWidgets.QTableWidgetItem('%d' % int(tool_idx))
-            point = value.get('point')
-            if point is None or point.is_empty:
-                # a Voronoi diagram that could not be made leaves points without coordinates
-                coords_item = QtWidgets.QTableWidgetItem('-')
-            else:
-                xy_coords = (self.app.dec_format(point.x, dec=self.app.decimals),
-                             self.app.dec_format(point.y, dec=self.app.decimals))
-                coords_item = QtWidgets.QTableWidgetItem(str(xy_coords))
+            point = value['point']
+            xy_coords = (self.app.dec_format(point.x, dec=self.app.decimals),
+                         self.app.dec_format(point.y, dec=self.app.decimals))
+            coords_item = QtWidgets.QTableWidgetItem(str(xy_coords))
             height = self.app.dec_format(value['height'], dec=self.app.decimals)
             height_item = QtWidgets.QTableWidgetItem(str(height))
 
@@ -1076,6 +1075,7 @@ class ToolLevelling(CNCjob, AppTool):
             snapped_pos = self.app.geo_editor.snap(pos[0], pos[1])
 
             # do not add the point if is already added
+            self.al_drop_empty_points()
             old_points_coords = [(pt['point'].x, pt['point'].y) for pt in self.al_voronoi_geo_storage.values()]
             if (snapped_pos[0], snapped_pos[1]) in old_points_coords:
                 return
@@ -1464,6 +1464,7 @@ class ToolLevelling(CNCjob, AppTool):
         if self.ui.al_method_radio.get_value() == 'b':
             pts = [(pt[0], pt[1], pt[2]) for pt in self.al_bilinear_geo_storage]
         else:
+            self.al_drop_empty_points()
             pts = [
                 (val['point'].x, val['point'].y, val['height']) for val in self.al_voronoi_geo_storage.values()
             ]
@@ -2061,6 +2062,7 @@ class ToolLevelling(CNCjob, AppTool):
         snd = cmd + '\n'
         self.grbl_ser_port.write(snd.encode('utf-8'))
         answer, acknowledged = self.grbl_read_reply(timeout=timeout, keep_status=cmd == '?')
+        self.grbl_last_answer = answer
         if acknowledged and cmd.upper() == '$H':
             self.grbl_homed = True
 
@@ -2406,10 +2408,34 @@ class ToolLevelling(CNCjob, AppTool):
             return True
 
         if self.grbl_resets == resets:
-            self.app.inform.emit(
-                '[ERROR_NOTCL] %s' % _("The homing cycle failed. The answer of the controller is in the shell; "
-                                       "error:5 means that homing is disabled with $22=0."))
+            self.app.inform.emit('[ERROR_NOTCL] %s %s' % (_("The homing cycle failed."),
+                                                          self.grbl_homing_failure(self.grbl_last_answer)))
         return False
+
+    @staticmethod
+    def grbl_homing_failure(answer):
+        """
+        Why a homing cycle failed, from the answer of the controller to $H.
+
+        :param answer:  the lines of the answer
+        :type answer:   list
+        :return:        the reason
+        :rtype:         str
+        """
+        reasons = {
+            'error:5': _("Homing is disabled ($22=0)."),
+            'alarm:6': _("The homing cycle was stopped by a reset."),
+            'alarm:7': _("The safety door was opened during the homing cycle."),
+            'alarm:8': _("The pull-off ($27) did not move the axis off its limit switch."),
+            'alarm:9': _("A limit switch was not found within the search distance (1.5 x the max travel $13x). "
+                         "Check that the motors are powered and that the switches are wired and work: "
+                         "the pins of the pressed switches show in the status report (Pn:)."),
+        }
+        for line in answer or []:
+            reason = reasons.get(line.strip().lower())
+            if reason:
+                return reason
+        return _("The answer of the controller is in the shell.")
 
     def grbl_soft_reset(self):
         """
@@ -2618,6 +2644,9 @@ class ToolLevelling(CNCjob, AppTool):
         coords = []
         al_method = self.ui.al_method_radio.get_value()
         if al_method == 'v':
+            if storage is self.al_voronoi_geo_storage:
+                self.al_drop_empty_points()
+                storage = self.al_voronoi_geo_storage
             for id_key, value in storage.items():
                 x = value['point'].x
                 y = value['point'].y
@@ -2888,6 +2917,19 @@ class ToolLevelling(CNCjob, AppTool):
         self.store_probed_points(probed_points)
         self.build_al_table_sig.emit()
         self.autolevell_gcode()
+
+    def al_drop_empty_points(self):
+        """
+        Remove the probe points that have no coordinates and number the others again from 1, in the same order.
+        The probed heights are matched to the points by those numbers.
+        """
+        storage = self.al_voronoi_geo_storage
+        empty = [k for k, val in storage.items() if val.get('point') is None or val['point'].is_empty]
+        if not empty:
+            return
+        self.app.log.warning("ToolLevelling.al_drop_empty_points() --> probe points without coordinates: %s" % empty)
+        kept = [val for k, val in sorted(storage.items(), key=lambda item: int(item[0])) if k not in empty]
+        self.al_voronoi_geo_storage = {idx: val for idx, val in enumerate(kept, 1)}
 
     def store_probed_points(self, probed_points):
         """
@@ -3775,6 +3817,7 @@ class ToolLevelling(CNCjob, AppTool):
         """
         if self.ui.al_method_radio.get_value() == 'b':
             return [(pt[0], pt[1]) for pt in self.al_bilinear_geo_storage]
+        self.al_drop_empty_points()
         return [
             (val['point'].x, val['point'].y) for val in self.al_voronoi_geo_storage.values()
         ]
