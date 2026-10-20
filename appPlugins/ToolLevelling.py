@@ -32,6 +32,7 @@ from appEditors.appTextEditor import AppTextEditor
 
 from camlib import CNCjob
 
+import contextlib
 import time
 import threading
 import serial
@@ -191,6 +192,12 @@ class ToolLevelling(CNCjob, AppTool):
         self.grbl_limits_suspended = False
         # a status report that was read before all of it arrived
         self.grbl_poll_partial = b''
+        # how many are reading answers from the port right now; app.inform runs processEvents(), which can run the
+        # status poll in the middle of a read on the GUI thread, and the poll must not take bytes from that answer
+        self.grbl_port_readers = 0
+        self.grbl_port_readers_lock = threading.Lock()
+        # when the last status report came in, to show that the position display is not current
+        self.grbl_status_time = 0.0
 
         # asks the controller for its status, for the position display
         self.grbl_status_timer = QtCore.QTimer()
@@ -591,10 +598,14 @@ class ToolLevelling(CNCjob, AppTool):
             row_no = tool_idx - 1
 
             t_id = QtWidgets.QTableWidgetItem('%d' % int(tool_idx))
-            x = value['point'].x
-            y = value['point'].y
-            xy_coords = self.app.dec_format(x, dec=self.app.decimals), self.app.dec_format(y, dec=self.app.decimals)
-            coords_item = QtWidgets.QTableWidgetItem(str(xy_coords))
+            point = value.get('point')
+            if point is None or point.is_empty:
+                # a Voronoi diagram that could not be made leaves points without coordinates
+                coords_item = QtWidgets.QTableWidgetItem('-')
+            else:
+                xy_coords = (self.app.dec_format(point.x, dec=self.app.decimals),
+                             self.app.dec_format(point.y, dec=self.app.decimals))
+                coords_item = QtWidgets.QTableWidgetItem(str(xy_coords))
             height = self.app.dec_format(value['height'], dec=self.app.decimals)
             height_item = QtWidgets.QTableWidgetItem(str(height))
 
@@ -1757,6 +1768,16 @@ class ToolLevelling(CNCjob, AppTool):
                 # a limit was hit or the controller was reset while moving, the position is not trusted anymore
                 self.grbl_homed = False
 
+    @contextlib.contextmanager
+    def grbl_port_reader(self):
+        with self.grbl_port_readers_lock:
+            self.grbl_port_readers += 1
+        try:
+            yield
+        finally:
+            with self.grbl_port_readers_lock:
+                self.grbl_port_readers -= 1
+
     def grbl_note_status(self, line):
         """
         Parse a status report like <Idle|MPos:0.000,0.000,0.000|FS:0,0|WCO:0.000,0.000,0.000|Pn:Z>
@@ -1764,6 +1785,10 @@ class ToolLevelling(CNCjob, AppTool):
         :param line:    the status report
         :type line:     str
         """
+        if not line.strip().endswith('>'):
+            # a piece of a report; the numbers in it are not to be trusted
+            return
+        self.grbl_status_time = time.monotonic()
         self.grbl_status_line = line.strip()
         fields = line.strip().strip('<>').split('|')
         status = self.grbl_status
@@ -1840,21 +1865,12 @@ class ToolLevelling(CNCjob, AppTool):
             self.grbl_status_timer.stop()
             return
 
-        reading = not self.grbl_busy and not (self.grbl_job_running and not self.grbl_job_waiting)
+        reading = not self.grbl_busy and not (self.grbl_job_running and not self.grbl_job_waiting) and \
+            self.grbl_port_readers == 0
         try:
             self.grbl_ser_port.write(b'?')
             if reading:
-                waiting = self.grbl_ser_port.in_waiting
-                if waiting:
-                    raw = self.grbl_poll_partial + self.grbl_ser_port.read(waiting)
-                    lines = raw.split(b'\n')
-                    self.grbl_poll_partial = lines.pop()
-                    decoded = self.grbl_decode(lines)
-                    self.grbl_note_lines(decoded)
-                    for line in decoded:
-                        # what the controller says on its own, a limit alarm for instance, would be lost otherwise
-                        if line and not line.startswith('<') and line.lower() != 'ok':
-                            self.app.inform_shell.emit('\t\t\t: ' + line.upper())
+                self.grbl_poll_port()
             else:
                 self.grbl_poll_partial = b''
         except Exception as e:
@@ -1868,6 +1884,25 @@ class ToolLevelling(CNCjob, AppTool):
         if reading and self.grbl_limits_suspended and state == 'idle' and \
                 not any(axis in self.grbl_status['pins'] for axis in 'XYZ'):
             self.grbl_run_in_background(self.grbl_restore_hard_limits)
+
+    def grbl_poll_port(self):
+        """
+        Read what came in for the position display without waiting for it.
+        """
+        with self.grbl_port_reader():
+            waiting = self.grbl_ser_port.in_waiting
+            if not waiting:
+                return
+            raw = self.grbl_poll_partial + self.grbl_ser_port.read(waiting)
+            lines = raw.split(b'\n')
+            self.grbl_poll_partial = lines.pop()
+            decoded = self.grbl_decode(lines)
+            self.grbl_note_lines(decoded)
+
+        for line in decoded:
+            # what the controller says on its own, a limit alarm for instance, would be lost otherwise
+            if line and not line.startswith('<') and line.lower() != 'ok':
+                self.app.inform_shell.emit('\t\t\t: ' + line.upper())
 
     @staticmethod
     def grbl_origin_target(travelz, wco, ceilings):
@@ -1913,8 +1948,12 @@ class ToolLevelling(CNCjob, AppTool):
                         text += '  (%s)' % _("probe touching")
                 if self.grbl_limits_suspended:
                     text += '  (%s)' % _("hard limits off")
+                age = time.monotonic() - self.grbl_status_time
+                stale = age > 2.0
+                if stale:
+                    text += '  (%s %d s)' % (_("NOT UPDATING, last report"), age)
                 self.ui.grbl_state_label.set_value(text)
-                color = 'red' if state.lower().startswith('alarm') else \
+                color = 'gray' if stale else 'red' if state.lower().startswith('alarm') else \
                     'darkorange' if state.lower().startswith(('hold', 'door')) else 'seagreen'
                 self.ui.grbl_state_label.setStyleSheet("QLabel {color: %s; font-weight: bold;}" % color)
 
@@ -1943,6 +1982,10 @@ class ToolLevelling(CNCjob, AppTool):
             pass
 
     def grbl_read_reply(self, timeout=30.0, keep_status=False):
+        with self.grbl_port_reader():
+            return self._grbl_read_reply(timeout=timeout, keep_status=keep_status)
+
+    def _grbl_read_reply(self, timeout=30.0, keep_status=False):
         """
         Read the answer of the GRBL controller until it acknowledges the command with 'ok' or reports a problem.
         The serial port has a short read timeout therefore reading is repeated until the deadline.
@@ -3465,6 +3508,10 @@ class ToolLevelling(CNCjob, AppTool):
                 self.app.inform_shell.emit('\t\t\t: %s' % response.upper())
 
     def grbl_read_status(self, timeout=2.0):
+        with self.grbl_port_reader():
+            return self._grbl_read_status(timeout=timeout)
+
+    def _grbl_read_status(self, timeout=2.0):
         """
         The state that the controller reports. Nothing may be waiting for an acknowledgement when this is
         called because the status reports are read from the same port.

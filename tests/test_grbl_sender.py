@@ -418,6 +418,9 @@ def make_sender(port):
     tool.grbl_settings = {}
     tool.grbl_limits_suspended = False
     tool.grbl_poll_partial = b''
+    tool.grbl_port_readers = 0
+    tool.grbl_port_readers_lock = threading.Lock()
+    tool.grbl_status_time = 0.0
     tool.grbl_status_timer = SimpleNamespace(start=lambda: None, stop=lambda: None)
     tool.ui.grbl_wpos_labels = [FakeWidget() for _i in range(3)]
     tool.ui.grbl_mpos_labels = [FakeWidget() for _i in range(3)]
@@ -631,6 +634,25 @@ class TestStatus(unittest.TestCase):
             self.sender.on_grbl_status_tick()
         self.assertEqual(self.sender.grbl_status['mpos'], [0.0, 0.0, 0.0])
         self.assertEqual(self.sender.ui.grbl_mpos_labels[2].get_value(), '0.000')
+
+    def test_a_piece_of_a_report_is_not_used(self):
+        self.sender.grbl_note_status('<Idle|MPos:0.000,0.000,162.5')
+        self.assertIsNone(self.sender.grbl_status['mpos'])
+
+    def test_the_display_does_not_read_in_the_middle_of_an_answer(self):
+        # app.inform runs processEvents(), so the poll can run while an answer is being read on the GUI thread
+        grbl = self.sender.grbl_ser_port
+        grbl.write(b'?')
+        with self.sender.grbl_port_reader():
+            self.sender.on_grbl_status_tick()
+            self.assertGreater(grbl.in_waiting, 0)
+        self.assertEqual(self.sender.grbl_read_status(), 'idle')
+
+    def test_a_display_that_is_not_updated_says_so(self):
+        self.sender.grbl_note_status('<Idle|MPos:0.000,0.000,0.000|FS:0,0>')
+        self.sender.grbl_status_time -= 5
+        self.sender.grbl_update_position_ui()
+        self.assertIn('NOT UPDATING', self.sender.ui.grbl_state_label.get_value())
 
     def test_the_display_shows_where_go_to_origin_goes(self):
         grbl = self.sender.grbl_ser_port
