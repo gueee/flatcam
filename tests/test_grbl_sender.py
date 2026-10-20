@@ -7,6 +7,7 @@ a job that is streamed through a tool change at which the operator touches off t
 Run: python tests/test_grbl_sender.py
 """
 
+import contextlib
 import logging
 import os
 import re
@@ -422,6 +423,7 @@ def make_sender(port):
     tool.ui.grbl_mpos_labels = [FakeWidget() for _i in range(3)]
     tool.ui.grbl_wco_labels = [FakeWidget() for _i in range(3)]
 
+    tool.build_al_table_sig = Recorder()
     tool.grbl_job_progress_sig = Recorder()
     tool.grbl_job_paused_sig = Recorder()
     tool.grbl_job_finished_sig = Recorder()
@@ -491,6 +493,84 @@ class TestJogCommands(unittest.TestCase):
         self.assertEqual(ToolLevelling.grbl_jog_commands('zplus', 'IN', '0.5', '50.0', '0.6',
                                                          ceilings=[None, None, -1.0], mpos=[0.0, 0.0, -1.0]),
                          ['$J=G91 G20 Z0.5 F50.0'])
+
+
+class TestAutolevelHeights(unittest.TestCase):
+    """The work Z zero is on the copper, 35 mm below the machine zero; the board sags by 0.05 mm in the middle."""
+
+    def setUp(self):
+        self.grbl = FakeGrbl(surface_z=-35.05)
+        self.grbl.mpos = [-100.0, -100.0, -30.0]
+        self.grbl.wco = [-120.0, -120.0, -35.0]
+        self.sender = make_sender(self.grbl)
+
+    def level(self, heights):
+        job = SimpleNamespace(is_levelled_gcode=False, coords_decimals=4, multitool=False, tools={},
+                              is_segmented_gcode=True, obj_options={'type': 'Geometry'},
+                              gcode='G00 Z5.0\nG01 X1.0 Y1.0\nG01 Z-0.1 F100\nG01 X9.0 Y9.0\n',
+                              prepend_snippet='', append_snippet='', gc_start='')
+        self.sender.app.collection = SimpleNamespace(get_by_name=lambda name: job)
+        self.sender.ui.al_method_radio.set_value('b')
+        self.sender.ui.al_rows_entry.set_value(2)
+        self.sender.ui.al_columns_entry.set_value(2)
+        self.sender.al_bilinear_geo_storage = [(0.0, 0.0, heights[0]), (10.0, 0.0, heights[1]),
+                                               (0.0, 10.0, heights[2]), (10.0, 10.0, heights[3])]
+        return self.sender.autolevell_gcode(), job
+
+    def test_the_probed_height_is_in_work_coordinates(self):
+        wco = self.sender.grbl_read_work_offset(timeout=2.0)
+        answer = self.sender.send_grbl_command('G38.2 Z-10 F50', echo=False)
+        machine_z = self.sender.parse_probe_answer(answer)
+
+        self.assertAlmostEqual(machine_z, -35.05)
+        self.assertAlmostEqual(ToolLevelling.grbl_work_height(machine_z, wco[2], 'MM'), -0.05)
+
+    def test_inch(self):
+        self.assertAlmostEqual(ToolLevelling.grbl_work_height(-35.254, -35.0, 'IN'), -0.01)
+
+    def test_the_work_offset_is_read_fresh(self):
+        self.sender.grbl_status['wco'] = [0.0, 0.0, 0.0]
+        self.assertEqual(self.sender.grbl_read_work_offset(timeout=2.0), [-120.0, -120.0, -35.0])
+
+    def test_heights_in_machine_coordinates_are_not_applied(self):
+        # what the probing stored before: the Z of the [PRB:...] answers, 35 mm below the work Z zero
+        result, job = self.level([-35.0, -35.02, -35.05, -35.01])
+
+        self.assertEqual(result, 'fail')
+        self.assertIn('Z-0.1 ', job.gcode + ' ')
+        self.assertFalse(job.is_levelled_gcode)
+        self.assertIn('not applied', self.sender.app.inform.text())
+
+    def test_the_whole_probing_run(self):
+        result, job = self.level([0.0, 0.0, 0.0, 0.0])
+        job.is_levelled_gcode = False
+        job.gcode = 'G00 Z5.0\nG01 X1.0 Y1.0\nG01 Z-0.1 F100\nG01 X9.0 Y9.0\n'
+        self.sender.app.inform.messages.clear()
+
+        self.sender.app.worker_task = Recorder(on_emit=lambda task: task['fcn']())
+        self.sender.app.proc_container = SimpleNamespace(new=lambda text: contextlib.nullcontext())
+        self.sender.probe_points = lambda: [(0.0, 0.0), (10.0, 0.0), (0.0, 10.0), (10.0, 10.0)]
+        self.sender.al_voronoi_geo_storage = {}
+        self.sender.build_al_table = lambda: None
+        self.sender.ui.ptravelz_entry.set_value(5.0)
+        self.sender.ui.feedrate_probe_entry.set_value(50.0)
+        self.sender.ui.pdepth_entry.set_value(-10.0)
+
+        self.sender.on_grbl_autolevel()
+
+        self.assertEqual([round(h, 3) for _x, _y, h in self.sender.al_bilinear_geo_storage], [-0.05] * 4)
+        self.assertTrue(job.is_levelled_gcode)
+        # the cut follows the surface 0.05 mm below the work Z zero, and the travel height stays where it was
+        self.assertIn('G01 Z-0.1500', job.gcode)
+        self.assertIn('Z4.9500', job.gcode)
+        self.assertNotIn('Z-35', job.gcode)
+
+    def test_the_warp_of_a_board_is_applied(self):
+        result, job = self.level([0.0, -0.02, -0.05, -0.01])
+
+        self.assertIsNone(result)
+        self.assertTrue(job.is_levelled_gcode)
+        self.assertNotIn('Z-0.1 ', job.gcode)
 
 
 class TestJobTopZ(unittest.TestCase):

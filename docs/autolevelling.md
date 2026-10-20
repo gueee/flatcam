@@ -160,9 +160,17 @@ touch plate. Keep the feedrate low, 80 mm/min or less on a Masuter 3S. If the pr
 within Probe travel, no origin is set, the failure is reported, and the controller is left in an
 alarm state that **Unlock** clears.
 
-**Sender tab.** Press **Apply AutoLevelling**. FlatCAM walks every probe point: it lifts to
-Probe Z travel, moves to the point, probes down at Probe Feedrate, and reads the height back from
-the controller's `[PRB:...]` answer. The measured heights fill the Probe Points Table as it goes.
+**Sender tab.** First set the work Z zero on the surface of the material, with **Probe Z** for
+instance. Then press **Apply AutoLevelling**. FlatCAM walks every probe point: it lifts to Probe Z
+travel, moves to the point, probes down at Probe Feedrate, and reads the height back from the
+controller's `[PRB:...]` answer. The measured heights fill the Probe Points Table as it goes.
+
+GRBL reports the touch point in machine coordinates. FlatCAM converts it to a height above or below
+your work Z zero, using the work offset it reads from the controller just before probing. The heights
+are therefore the warp of the board, a few hundredths of a mm. If any of them is more than 2 mm from
+the work Z zero, the levelling is not applied, because the Z zero is evidently not on the surface and
+the corrected job would drive the tool into the material. Set the Z zero on the surface and probe
+again.
 
 If a probe reaches Probe Z depth without touching anything, the run stops and tells you which point
 failed instead of recording a bogus zero. Check that your probe clip is attached and that Probe Z

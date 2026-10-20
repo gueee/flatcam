@@ -105,6 +105,8 @@ class ToolLevelling(CNCjob, AppTool):
     )
     # GRBL has a 128 byte serial receive buffer of which one slot is always left empty
     grbl_rx_buffer = 127
+    # the farthest a probed height may be from the work Z zero, in mm; the warp of a board is a fraction of it
+    al_max_height = 2.0
 
     def __init__(self, app):
         self.app = app
@@ -195,9 +197,13 @@ class ToolLevelling(CNCjob, AppTool):
         self.grbl_status_timer.setInterval(250)
         self.grbl_status_timer.timeout.connect(self.on_grbl_status_tick)
 
-        # connected once here and not with the other signals, which are connected again every time the UI is
-        # built: a second connection would end the busy state of two commands at once
+        # the signals of the plugin are connected once here; set_tool_ui() runs every time the panel is built and a
+        # connection made there would be made again each time, which runs the slot once more per build
         self.grbl_busy_done_sig.connect(self.on_grbl_busy_done)
+        self.build_al_table_sig.connect(self.build_al_table)
+        self.grbl_job_progress_sig.connect(self.on_grbl_job_progress)
+        self.grbl_job_finished_sig.connect(self.on_grbl_job_finished)
+        self.grbl_job_paused_sig.connect(self.on_grbl_job_paused)
 
         self.probing_shapes = None
 
@@ -273,10 +279,6 @@ class ToolLevelling(CNCjob, AppTool):
         self.app.ui.notebook.setTabText(2, _("Levelling"))
 
     def connect_signals_at_init(self):
-        self.build_al_table_sig.connect(self.build_al_table)
-        self.grbl_job_progress_sig.connect(self.on_grbl_job_progress)
-        self.grbl_job_finished_sig.connect(self.on_grbl_job_finished)
-        self.grbl_job_paused_sig.connect(self.on_grbl_job_paused)
         self.ui.level.toggled.connect(self.on_level_changed)
 
         self.ui.avoid_exc_holes_cb.toggled.connect(self.on_avoid_exc_holes)
@@ -1240,6 +1242,17 @@ class ToolLevelling(CNCjob, AppTool):
             self.app.inform.emit(
                 '[ERROR_NOTCL] %s' % _("There is no height data. Do a probing job or import a height map first.")
             )
+            return 'fail'
+
+        # the heights are added to every Z of the job; far from the work Z zero they are not the warp of the
+        # material but a Z zero that is not on its surface, and applying them would drive the tool into it
+        limit = self.al_max_height if self.units == 'MM' else self.al_max_height / 25.4
+        worst = max(heights, key=abs)
+        if abs(worst) > limit:
+            self.app.inform.emit('[ERROR_NOTCL] %s' % (
+                _("A probed height is %.3f, more than %.3f away from the work Z zero. The levelling was not "
+                  "applied: set the work Z zero on the surface of the material, with Probe Z for instance, and "
+                  "probe again.") % (worst, limit)))
             return 'fail'
 
         dec = target_obj.coords_decimals
@@ -2876,6 +2889,15 @@ class ToolLevelling(CNCjob, AppTool):
                 cmd = 'G90'
                 self.send_grbl_command(command=cmd)
 
+                # GRBL reports the probed point in machine coordinates and the job is in work coordinates; a
+                # machine Z taken for a height moves every cut by the distance of the work Z zero to the machine
+                # zero, tens of mm down into the material
+                wco = self.grbl_read_work_offset()
+                if wco is None:
+                    self.app.inform.emit('[ERROR_NOTCL] %s' % _("The GRBL controller did not report the work "
+                                                                "offset. Nothing was probed."))
+                    return
+
                 probed_points = []
                 for x, y in self.probe_points():
                     cmd = 'G0 Z%s' % pr_travelz
@@ -2887,13 +2909,13 @@ class ToolLevelling(CNCjob, AppTool):
 
                     self.grbl_probe_result += output + '\n'
 
-                    height = self.parse_probe_answer(output)
-                    if height is None:
+                    machine_z = self.parse_probe_answer(output)
+                    if machine_z is None:
                         self.app.inform.emit(
                             '[ERROR_NOTCL] %s: %s, %s' % (_("Probing failed in point"), str(x), str(y))
                         )
                         return
-                    probed_points.append((x, y, height))
+                    probed_points.append((x, y, self.grbl_work_height(machine_z, wco[2], self.units)))
 
                 cmd = 'G0 Z%s' % pr_travelz
                 self.send_grbl_command(command=cmd)
@@ -2910,6 +2932,42 @@ class ToolLevelling(CNCjob, AppTool):
 
         self.app.inform.emit('%s' % _("Sending probing GCode to the GRBL controller."))
         self.app.worker_task.emit({'fcn': worker_task, 'params': []})
+
+    def grbl_read_work_offset(self, timeout=10.0):
+        """
+        The offset of the work coordinates from the machine coordinates, as the controller reports it now. GRBL
+        includes it in a status report only every few reports, therefore the one that was kept from earlier is
+        dropped and a new one is waited for.
+
+        :param timeout: for how long to wait for the report, in seconds
+        :type timeout:  float
+        :return:        the X, Y and Z offset in mm, or None when the controller did not report it
+        :rtype:         list or None
+        """
+        self.grbl_status['wco'] = None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self.grbl_read_status()
+            if self.grbl_status['wco'] is not None:
+                return list(self.grbl_status['wco'])
+        return None
+
+    @staticmethod
+    def grbl_work_height(machine_z, wco_z, units):
+        """
+        The height of a probed point in the work coordinates the job uses.
+
+        :param machine_z:   the Z of the [PRB:...] answer, in machine coordinates, in mm
+        :type machine_z:    float
+        :param wco_z:       the Z of the work offset, in mm
+        :type wco_z:        float
+        :param units:       the units of the job, 'MM' or 'IN'
+        :type units:        str
+        :return:            the height relative to the work Z zero, in the units of the job
+        :rtype:             float
+        """
+        height = machine_z - wco_z
+        return height / 25.4 if units == 'IN' else height
 
     def on_grbl_heightmap_save(self):
         if self.grbl_probe_result != '':
