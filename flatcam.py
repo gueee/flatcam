@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import sys
 import os
+import logging
 import traceback
 from datetime import datetime
 
@@ -101,6 +102,13 @@ if __name__ == '__main__':
 
     debug_trace()
     VisPyPatches.apply_patches()
+
+    # VisPy catches the errors raised while the plot area is drawn and only prints them, to a console that the
+    # windowed application does not have
+    vispy_log_handler = logging.FileHandler(log_file_path, encoding='utf-8')
+    vispy_log_handler.setLevel(logging.WARNING)
+    vispy_log_handler.setFormatter(logging.Formatter('%(asctime)s VisPy %(levelname)s: %(message)s'))
+    logging.getLogger('vispy').addHandler(vispy_log_handler)
 
     def excepthook(exc_type, exc_value, exc_tb):
         msg = '%s\n' % str(datetime.today())
