@@ -7582,6 +7582,8 @@ class App(QtCore.QObject):
         d_properties_tw.addChild(parent=canvas_cat,
                                  title=['%s:' % _("HUD"), '%s' % str(self.options['global_hud'])],
                                  column1=True)
+        # setWidget() deletes the widget it replaces, which would be the UI of an object that is still in use
+        self.ui.properties_scroll_area.takeWidget()
         self.ui.properties_scroll_area.setWidget(d_properties_tw)
 
     def setup_obj_classes(self):

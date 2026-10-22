@@ -335,10 +335,9 @@ class FlatCAMObj(QtCore.QObject):
         try:
             self.app.ui.properties_scroll_area.setWidget(self.ui)
         except RuntimeError:
-            try:
-                self.app.ui.properties_scroll_area.setWidget(self.ui)
-            except Exception:
-                pass
+            # the UI of this object was deleted, by a setWidget() of something else into the Properties tab
+            self.set_ui(self.ui_type(app=self.app))
+            self.app.ui.properties_scroll_area.setWidget(self.ui)
         # self.ui.setMinimumWidth(100)
         # self.ui.setMaximumWidth(self.app.ui.properties_tab.sizeHint().width())
 
