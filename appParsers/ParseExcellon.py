@@ -1075,7 +1075,9 @@ class Excellon(Geometry):
             # clear the solid_geometry in self.tools
             for tool in self.tools:
                 self.tools[tool]['solid_geometry'] = []
-                self.tools[tool]['data'] = {}
+                # the parameters of a tool are kept: this runs after every move, mirror, scale, rotation etc.
+                if not self.tools[tool].get('data'):
+                    self.tools[tool]['data'] = deepcopy(self.default_data)
 
             for tool in self.tools:
                 tooldia = self.tools[tool]['tooldia']
@@ -1086,7 +1088,6 @@ class Excellon(Geometry):
 
                         # add poly in the tools geometry
                         self.tools[tool]['solid_geometry'].append(poly)
-                        self.tools[tool]['data'] = deepcopy(self.default_data)
 
                         # add poly to the total solid geometry
                         self.solid_geometry.append(poly)
@@ -1101,7 +1102,6 @@ class Excellon(Geometry):
 
                         # add poly in the tools geometry
                         self.tools[tool]['solid_geometry'].append(poly)
-                        self.tools[tool]['data'] = deepcopy(self.default_data)
 
                         # add poly to the total solid geometry
                         self.solid_geometry.append(poly)
